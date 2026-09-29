@@ -1,0 +1,11 @@
+# Build output
+/natrium-token-exchange
+/new-signing-key
+*.test
+*.out
+coverage.*
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
