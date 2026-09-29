@@ -7,7 +7,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/prometheus/client_golang v1.24.1
 	github.com/stretchr/testify v1.12.1
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
