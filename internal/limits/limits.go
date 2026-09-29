@@ -1,5 +1,6 @@
 // Package limits bounds what one user can get from one instance of the service: the tokens issued in a window, and
-// the distinct client keys in use in a window. A key is in use from its last token until a whole window has passed.
+// the distinct client keys in use in a window. A key is in use from its last token until a whole window has passed. A
+// token without a key counts only against the tokens.
 //
 // The counts are kept in memory. The service has no store, so with several instances each one counts on its own, and
 // a user can get up to the limit from each.
@@ -93,7 +94,8 @@ func New(tokens, keys Limit) (*Limiter, error) {
 	return &Limiter{tokens: tokens, keys: keys, users: map[string]*usage{}}, nil
 }
 
-// Take records a token for user and key at now if both limits allow it. A refused request is not recorded.
+// Take records a token for user and key at now if both limits allow it. An empty key is a token without a key, which
+// only the token limit applies to. A refused request is not recorded.
 func (l *Limiter) Take(user, key string, now time.Time) Decision {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -106,7 +108,7 @@ func (l *Limiter) Take(user, key string, now time.Time) Decision {
 	if len(u.issued) >= l.tokens.N {
 		return Decision{RetryAfter: u.issued[0].Add(l.tokens.Window).Sub(now), Reason: ReasonTokens}
 	}
-	if _, known := u.keys[key]; !known && len(u.keys) >= l.keys.N {
+	if _, known := u.keys[key]; key != "" && !known && len(u.keys) >= l.keys.N {
 		oldest := now
 		for _, used := range u.keys {
 			if used.Before(oldest) {
@@ -116,7 +118,9 @@ func (l *Limiter) Take(user, key string, now time.Time) Decision {
 		return Decision{RetryAfter: oldest.Add(l.keys.Window).Sub(now), Reason: ReasonKeys}
 	}
 	u.issued = append(u.issued, now)
-	u.keys[key] = now
+	if key != "" {
+		u.keys[key] = now
+	}
 	l.users[user] = u
 	return Decision{Allowed: true}
 }

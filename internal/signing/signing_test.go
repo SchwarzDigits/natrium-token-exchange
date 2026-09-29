@@ -37,10 +37,8 @@ func clientKey(t *testing.T) ed25519.PublicKey {
 func newSigner(t *testing.T, keys []Key, current string) *Signer {
 	t.Helper()
 	s, err := New(keys, current, Options{
-		Issuer:   issuer,
-		Audience: audience,
-		TTL:      time.Hour,
-		Now:      func() time.Time { return fixedNow },
+		Issuer: issuer,
+		Now:    func() time.Time { return fixedNow },
 	})
 	require.NoError(t, err)
 	return s
@@ -85,7 +83,7 @@ func verify(t *testing.T, s *Signer, token string) (jwt.MapClaims, *jwt.Token) {
 func TestIssuedTokenVerifiesAgainstTheKeySet(t *testing.T) {
 	s := newSigner(t, []Key{key("k1", 1)}, "k1")
 	client := clientKey(t)
-	tok, err := s.Issue(Grant{Subject: subject, Team: team, PublicKey: client})
+	tok, err := s.Issue(Grant{Subject: subject, Team: team, Audience: audience, TTL: time.Hour, PublicKey: client})
 	require.NoError(t, err)
 	require.Equal(t, time.Hour, tok.ExpiresIn)
 
@@ -105,7 +103,7 @@ func TestIssuedTokenVerifiesAgainstTheKeySet(t *testing.T) {
 
 func TestTokenWithoutTeamHasNoTeamClaim(t *testing.T) {
 	s := newSigner(t, []Key{key("k1", 1)}, "k1")
-	tok, err := s.Issue(Grant{Subject: subject, PublicKey: clientKey(t)})
+	tok, err := s.Issue(Grant{Subject: subject, Audience: audience, TTL: time.Hour, PublicKey: clientKey(t)})
 	require.NoError(t, err)
 	claims, _ := verify(t, s, tok.JWT)
 	require.NotContains(t, claims, "team")
@@ -113,7 +111,7 @@ func TestTokenWithoutTeamHasNoTeamClaim(t *testing.T) {
 
 func TestTokenIDsAreUnique(t *testing.T) {
 	s := newSigner(t, []Key{key("k1", 1)}, "k1")
-	g := Grant{Subject: subject, PublicKey: clientKey(t)}
+	g := Grant{Subject: subject, Audience: audience, TTL: time.Hour, PublicKey: clientKey(t)}
 	a, err := s.Issue(g)
 	require.NoError(t, err)
 	b, err := s.Issue(g)
@@ -124,7 +122,7 @@ func TestTokenIDsAreUnique(t *testing.T) {
 
 func TestExpiredTokenIsRejectedByAVerifier(t *testing.T) {
 	s := newSigner(t, []Key{key("k1", 1)}, "k1")
-	tok, err := s.Issue(Grant{Subject: subject, PublicKey: clientKey(t)})
+	tok, err := s.Issue(Grant{Subject: subject, Audience: audience, TTL: time.Hour, PublicKey: clientKey(t)})
 	require.NoError(t, err)
 	_, err = jwt.Parse(tok.JWT, func(*jwt.Token) (any, error) {
 		return ed25519.NewKeyFromSeed(key("k1", 1).Seed).Public(), nil
@@ -135,7 +133,7 @@ func TestExpiredTokenIsRejectedByAVerifier(t *testing.T) {
 func TestRotationSignsWithTheCurrentKeyAndPublishesAll(t *testing.T) {
 	s := newSigner(t, []Key{key("old", 1), key("new", 2)}, "new")
 	require.Equal(t, "new", s.CurrentKeyID())
-	tok, err := s.Issue(Grant{Subject: subject, PublicKey: clientKey(t)})
+	tok, err := s.Issue(Grant{Subject: subject, Audience: audience, TTL: time.Hour, PublicKey: clientKey(t)})
 	require.NoError(t, err)
 	_, parsed := verify(t, s, tok.JWT)
 	require.Equal(t, "new", parsed.Header["kid"])
@@ -232,4 +230,14 @@ func TestParsePublicKey(t *testing.T) {
 		_, err := ParsePublicKey(raw)
 		require.ErrorIs(t, err, ErrWeakPublicKey, name)
 	}
+}
+
+func TestTokenWithoutKeyHasNoConfirmation(t *testing.T) {
+	s := newSigner(t, []Key{key("k1", 1)}, "k1")
+	tok, err := s.Issue(Grant{Subject: subject, Audience: audience, TTL: 10 * time.Minute})
+	require.NoError(t, err)
+	require.Equal(t, 10*time.Minute, tok.ExpiresIn)
+	claims, _ := verify(t, s, tok.JWT)
+	require.NotContains(t, claims, "cnf")
+	require.EqualValues(t, fixedNow.Add(10*time.Minute).Unix(), claims["exp"])
 }

@@ -1,6 +1,6 @@
 // Package wireauth checks a Wire access token by asking the Wire backend whose user it belongs to (GET /self). The
 // backend stays the only party that decides whether a token is valid. The package depends on nothing else in this
-// module. It is taken over from natrium-recovery-server and additionally reads the user's team.
+// module. It is taken over from natrium-pin-service and additionally reads the user's team.
 package wireauth
 
 import (

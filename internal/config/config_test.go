@@ -24,11 +24,12 @@ func setValid(t *testing.T) {
 	t.Helper()
 	t.Setenv(EnvWireAPIURL, "https://nginz-https.wire.example/v15")
 	t.Setenv(EnvIssuer, "https://token.example")
-	t.Setenv(EnvAudience, "wss://vfs.example/v1/ws")
+	t.Setenv(EnvStorageAudience, "wss://vfs.example/v1/ws")
 	t.Setenv(EnvSigningKeys, "k1:"+seed)
 	t.Setenv(EnvCurrentKeyID, "k1")
 	t.Setenv(EnvAllowedTeams, team)
-	for _, name := range []string{EnvPort, EnvLogLevel, EnvTokenTTL, EnvDeniedTeams, EnvAllowedUsers, EnvDeniedUsers,
+	for _, name := range []string{EnvPort, EnvLogLevel, EnvStorageTokenTTL, EnvPinAudience, EnvPinTokenTTL,
+		EnvDeniedTeams, EnvAllowedUsers, EnvDeniedUsers,
 		EnvTokenLimit, EnvKeyLimit, EnvMaxConcurrentWireChecks} {
 		t.Setenv(name, "")
 	}
@@ -40,7 +41,8 @@ func TestLoadDefaults(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, ":8080", cfg.Server.Addr)
 	require.Equal(t, slog.LevelInfo, cfg.LogLevel)
-	require.Equal(t, time.Hour, cfg.Server.TokenTTL)
+	require.Equal(t, time.Hour, cfg.Server.StorageTokenTTL)
+	require.Empty(t, cfg.Server.PinAudience)
 	require.Equal(t, server.DefaultTokenLimit, cfg.Server.TokenLimit)
 	require.Equal(t, server.DefaultKeyLimit, cfg.Server.KeyLimit)
 	require.Equal(t, server.DefaultMaxConcurrentWireChecks, cfg.Server.MaxConcurrentWireChecks)
@@ -54,7 +56,9 @@ func TestLoadAll(t *testing.T) {
 	setValid(t)
 	t.Setenv(EnvPort, "9090")
 	t.Setenv(EnvLogLevel, "debug")
-	t.Setenv(EnvTokenTTL, "30m")
+	t.Setenv(EnvStorageTokenTTL, "30m")
+	t.Setenv(EnvPinAudience, "https://pin.example")
+	t.Setenv(EnvPinTokenTTL, "5m")
 	t.Setenv(EnvAllowedTeams, "*")
 	t.Setenv(EnvDeniedTeams, team)
 	t.Setenv(EnvAllowedUsers, alice+", "+alice)
@@ -66,7 +70,9 @@ func TestLoadAll(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, ":9090", cfg.Server.Addr)
 	require.Equal(t, slog.LevelDebug, cfg.LogLevel)
-	require.Equal(t, 30*time.Minute, cfg.Server.TokenTTL)
+	require.Equal(t, 30*time.Minute, cfg.Server.StorageTokenTTL)
+	require.Equal(t, "https://pin.example", cfg.Server.PinAudience)
+	require.Equal(t, 5*time.Minute, cfg.Server.PinTokenTTL)
 	require.Equal(t, []string{"*"}, cfg.Server.AllowedTeams)
 	require.Equal(t, []string{team}, cfg.Server.DeniedTeams)
 	require.Equal(t, []string{alice, alice}, cfg.Server.AllowedUsers)
@@ -78,18 +84,19 @@ func TestLoadAll(t *testing.T) {
 
 func TestLoadNamesTheVariable(t *testing.T) {
 	for name, value := range map[string]string{
-		EnvPort:         "http",
-		EnvLogLevel:     "loud",
-		EnvWireAPIURL:   "http://nginz-https.wire.example/v15",
-		EnvIssuer:       "",
-		EnvAudience:     "",
-		EnvTokenTTL:     "an hour",
-		EnvSigningKeys:  "k1",
-		EnvCurrentKeyID: "k2",
-		EnvAllowedTeams: "sales",
-		EnvDeniedTeams:  "sales",
-		EnvAllowedUsers: "alice",
-		EnvDeniedUsers:  "bob",
+		EnvPort:            "http",
+		EnvLogLevel:        "loud",
+		EnvWireAPIURL:      "http://nginz-https.wire.example/v15",
+		EnvIssuer:          "",
+		EnvStorageAudience: "",
+		EnvStorageTokenTTL: "an hour",
+		EnvPinTokenTTL:     "ten minutes",
+		EnvSigningKeys:     "k1",
+		EnvCurrentKeyID:    "k2",
+		EnvAllowedTeams:    "sales",
+		EnvDeniedTeams:     "sales",
+		EnvAllowedUsers:    "alice",
+		EnvDeniedUsers:     "bob",
 
 		EnvTokenLimit:              "60",
 		EnvKeyLimit:                "0/24h",

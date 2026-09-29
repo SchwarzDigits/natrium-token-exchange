@@ -20,9 +20,12 @@ const (
 	EnvLogLevel   = "NATRIUM_TOKEN_EXCHANGE_LOG_LEVEL"
 	EnvWireAPIURL = "NATRIUM_TOKEN_EXCHANGE_WIRE_API_URL"
 	EnvIssuer     = "NATRIUM_TOKEN_EXCHANGE_ISSUER"
-	EnvAudience   = "NATRIUM_TOKEN_EXCHANGE_AUDIENCE"
-	// EnvTokenTTL is a Go duration, e.g. 1h or 30m.
-	EnvTokenTTL = "NATRIUM_TOKEN_EXCHANGE_TOKEN_TTL"
+	// EnvStorageAudience and EnvPinAudience are the aud claims; the PIN audience is optional.
+	EnvStorageAudience = "NATRIUM_TOKEN_EXCHANGE_STORAGE_AUDIENCE"
+	EnvPinAudience     = "NATRIUM_TOKEN_EXCHANGE_PIN_AUDIENCE"
+	// EnvStorageTokenTTL and EnvPinTokenTTL are Go durations, e.g. 1h or 10m.
+	EnvStorageTokenTTL = "NATRIUM_TOKEN_EXCHANGE_STORAGE_TOKEN_TTL"
+	EnvPinTokenTTL     = "NATRIUM_TOKEN_EXCHANGE_PIN_TOKEN_TTL"
 	// EnvSigningKeys is a comma-separated list of <key ID>:<base64url seed>. It is a secret.
 	EnvSigningKeys  = "NATRIUM_TOKEN_EXCHANGE_SIGNING_KEYS"
 	EnvCurrentKeyID = "NATRIUM_TOKEN_EXCHANGE_CURRENT_KEY_ID"
@@ -42,17 +45,19 @@ const defaultPort = 8080
 
 // envOf maps the fields of server.Config to the variables that set them, for error messages.
 var envOf = map[string]string{
-	"Addr":         EnvPort,
-	"WireAPIURL":   EnvWireAPIURL,
-	"Issuer":       EnvIssuer,
-	"Audience":     EnvAudience,
-	"TokenTTL":     EnvTokenTTL,
-	"SigningKeys":  EnvSigningKeys,
-	"CurrentKeyID": EnvCurrentKeyID,
-	"AllowedTeams": EnvAllowedTeams,
-	"DeniedTeams":  EnvDeniedTeams,
-	"AllowedUsers": EnvAllowedUsers,
-	"DeniedUsers":  EnvDeniedUsers,
+	"Addr":            EnvPort,
+	"WireAPIURL":      EnvWireAPIURL,
+	"Issuer":          EnvIssuer,
+	"StorageAudience": EnvStorageAudience,
+	"StorageTokenTTL": EnvStorageTokenTTL,
+	"PinAudience":     EnvPinAudience,
+	"PinTokenTTL":     EnvPinTokenTTL,
+	"SigningKeys":     EnvSigningKeys,
+	"CurrentKeyID":    EnvCurrentKeyID,
+	"AllowedTeams":    EnvAllowedTeams,
+	"DeniedTeams":     EnvDeniedTeams,
+	"AllowedUsers":    EnvAllowedUsers,
+	"DeniedUsers":     EnvDeniedUsers,
 
 	"TokenLimit":              EnvTokenLimit,
 	"KeyLimit":                EnvKeyLimit,
@@ -88,13 +93,19 @@ func Load() (Config, error) {
 
 	s.WireAPIURL = os.Getenv(EnvWireAPIURL)
 	s.Issuer = os.Getenv(EnvIssuer)
-	s.Audience = os.Getenv(EnvAudience)
-	if v := os.Getenv(EnvTokenTTL); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return Config{}, fmt.Errorf("%s: must be a duration such as 1h or 30m, got %q", EnvTokenTTL, v)
+	s.StorageAudience = os.Getenv(EnvStorageAudience)
+	s.PinAudience = os.Getenv(EnvPinAudience)
+	for _, v := range []struct {
+		name string
+		ttl  *time.Duration
+	}{{EnvStorageTokenTTL, &s.StorageTokenTTL}, {EnvPinTokenTTL, &s.PinTokenTTL}} {
+		if raw := os.Getenv(v.name); raw != "" {
+			d, err := time.ParseDuration(raw)
+			if err != nil {
+				return Config{}, fmt.Errorf("%s: must be a duration such as 1h or 10m, got %q", v.name, raw)
+			}
+			*v.ttl = d
 		}
-		s.TokenTTL = d
 	}
 	if v := os.Getenv(EnvSigningKeys); v != "" {
 		keys, err := server.ParseSigningKeys(v)

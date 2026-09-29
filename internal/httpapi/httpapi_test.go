@@ -35,7 +35,13 @@ const (
 	team      = "8b3c1a2e-0f4d-4e5a-9b6c-7d8e9f0a1b2c"
 	issuer    = "https://token.example"
 	audience  = "wss://vfs.example/v1/ws"
+	pinAud    = "https://pin.example"
 )
+
+var audiences = map[string]Audience{
+	"storage": {Aud: audience, TTL: time.Hour, Key: true},
+	"pin":     {Aud: pinAud, TTL: 10 * time.Minute},
+}
 
 type fakeAuth struct {
 	mu    sync.Mutex
@@ -85,7 +91,7 @@ const maxChecks = 2
 func newFixture(t *testing.T, sign func(*signing.Signer) Signer) *fixture {
 	t.Helper()
 	signer, err := signing.New([]signing.Key{{ID: "k1", Seed: bytes.Repeat([]byte{1}, signing.SeedSize)}}, "k1",
-		signing.Options{Issuer: issuer, Audience: audience, TTL: time.Hour})
+		signing.Options{Issuer: issuer})
 	require.NoError(t, err)
 	list, err := allow.New(allow.Rules{AllowedTeams: []string{team}})
 	require.NoError(t, err)
@@ -108,6 +114,7 @@ func newFixture(t *testing.T, sign func(*signing.Signer) Signer) *fixture {
 		Allow:               list,
 		Signer:              s,
 		Limits:              limiter,
+		Audiences:           audiences,
 		MaxConcurrentChecks: maxChecks,
 		Log:                 slog.New(slog.NewJSONHandler(f.logs, nil)),
 		Metrics:             prometheus.NewRegistry(),
@@ -127,7 +134,14 @@ func clientKey(t *testing.T) ed25519.PublicKey {
 }
 
 func body(key []byte) string {
-	return `{"publicKey":"` + base64.RawURLEncoding.EncodeToString(key) + `"}`
+	return `{"audience":"storage","publicKey":"` + base64.RawURLEncoding.EncodeToString(key) + `"}`
+}
+
+func publicKeyOf(t *testing.T, token string) any {
+	t.Helper()
+	parsed, _, err := jwt.NewParser().ParseUnverified(token, jwt.MapClaims{})
+	require.NoError(t, err)
+	return parsed.Claims.(jwt.MapClaims)["cnf"]
 }
 
 func (f *fixture) post(t *testing.T, auth, payload string) *httptest.ResponseRecorder {
@@ -182,6 +196,8 @@ func TestIssuesATokenBoundToTheClientKey(t *testing.T) {
 
 	logs := f.logs.String()
 	require.Contains(t, logs, `"result":"ok"`)
+	require.Contains(t, logs, `"audience":"storage"`)
+	require.EqualValues(t, 1, testutil.ToFloat64(f.api.issued.WithLabelValues("storage")))
 	require.Contains(t, logs, aliceID+"@"+domain)
 	require.Contains(t, logs, base64.RawURLEncoding.EncodeToString(key))
 	require.Contains(t, logs, claims["jti"])
@@ -231,20 +247,26 @@ func TestRejectsBadBodies(t *testing.T) {
 	key := clientKey(t)
 	encoded := base64.RawURLEncoding.EncodeToString(key)
 	for name, payload := range map[string]string{
-		"empty":            ``,
-		"not JSON":         `publicKey`,
-		"missing key":      `{}`,
-		"null key":         `{"publicKey":null}`,
-		"unknown field":    `{"publicKey":"` + encoded + `","extra":1}`,
-		"trailing data":    body(key) + `{}`,
-		"padded base64":    `{"publicKey":"` + base64.URLEncoding.EncodeToString(key) + `"}`,
-		"standard base64":  `{"publicKey":"` + base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{0xfb}, 32)) + `"}`,
-		"short key":        body(key[:31]),
-		"identity point":   body(edwards25519.NewIdentityPoint().Bytes()),
-		"too large":        `{"publicKey":"` + encoded + `"` + strings.Repeat(" ", maxBodyBytes) + `}`,
-		"array":            `[` + body(key) + `]`,
-		"key is a number":  `{"publicKey":42}`,
-		"two JSON objects": body(key) + body(key),
+		"empty":             ``,
+		"not JSON":          `publicKey`,
+		"empty object":      `{}`,
+		"missing audience":  `{"publicKey":"` + encoded + `"}`,
+		"unknown audience":  `{"audience":"backup","publicKey":"` + encoded + `"}`,
+		"null audience":     `{"audience":null}`,
+		"missing key":       `{"audience":"storage"}`,
+		"null key":          `{"audience":"storage","publicKey":null}`,
+		"key for pin":       `{"audience":"pin","publicKey":"` + encoded + `"}`,
+		"unknown field":     `{"audience":"storage","publicKey":"` + encoded + `","extra":1}`,
+		"trailing data":     body(key) + `{}`,
+		"padded base64":     `{"audience":"storage","publicKey":"` + base64.URLEncoding.EncodeToString(key) + `"}`,
+		"standard base64":   `{"audience":"storage","publicKey":"` + base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{0xfb}, 32)) + `"}`,
+		"short key":         body(key[:31]),
+		"identity point":    body(edwards25519.NewIdentityPoint().Bytes()),
+		"too large":         `{"audience":"storage","publicKey":"` + encoded + `"` + strings.Repeat(" ", maxBodyBytes) + `}`,
+		"array":             `[` + body(key) + `]`,
+		"key is a number":   `{"audience":"storage","publicKey":42}`,
+		"two JSON objects":  body(key) + body(key),
+		"audience a number": `{"audience":1}`,
 	} {
 		rec := f.post(t, "Bearer "+wireToken, payload)
 		require.Equal(t, http.StatusBadRequest, rec.Code, name)
@@ -340,4 +362,43 @@ func TestBoundsConcurrentChecks(t *testing.T) {
 	}
 	f.auth.release = nil
 	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(key)).Code, "the slots are free again")
+}
+
+func TestIssuesAPinTokenWithoutKey(t *testing.T) {
+	f := newFixture(t, nil)
+	rec := f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var resp struct {
+		Token     string `json:"token"`
+		ExpiresIn int64  `json:"expiresIn"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.EqualValues(t, 600, resp.ExpiresIn)
+
+	parsed, err := jwt.Parse(resp.Token, func(*jwt.Token) (any, error) {
+		return ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, signing.SeedSize)).Public(), nil
+	}, jwt.WithValidMethods([]string{"EdDSA"}), jwt.WithIssuer(issuer), jwt.WithAudience(pinAud))
+	require.NoError(t, err)
+	claims := parsed.Claims.(jwt.MapClaims)
+	require.Equal(t, aliceID+"@"+domain, claims["sub"])
+	require.Nil(t, publicKeyOf(t, resp.Token), "a PIN token is not bound to a key")
+
+	_, err = jwt.Parse(resp.Token, func(*jwt.Token) (any, error) {
+		return ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, signing.SeedSize)).Public(), nil
+	}, jwt.WithAudience(audience))
+	require.Error(t, err, "the storage server must not accept a PIN token")
+
+	require.Contains(t, f.logs.String(), `"audience":"pin"`)
+	require.NotContains(t, f.logs.String(), `"key"`)
+	require.EqualValues(t, 1, testutil.ToFloat64(f.api.issued.WithLabelValues("pin")))
+}
+
+func TestPinTokensCountOnlyAsTokens(t *testing.T) {
+	f := newFixture(t, nil)
+	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(clientKey(t))).Code)
+	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(clientKey(t))).Code)
+	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code,
+		"the key limit of 2 is full, but a PIN token has no key")
+	require.Equal(t, http.StatusTooManyRequests, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code,
+		"the token limit of 3 applies to PIN tokens too")
 }

@@ -1,6 +1,6 @@
 // Package signing holds the Ed25519 keys of the service, issues the tokens and publishes the public keys as a JSON Web
-// Key Set (RFC 7517). A token is a JSON Web Token (RFC 7519) signed with EdDSA (RFC 8037) and bound to the client's
-// Ed25519 key with a confirmation claim (RFC 7800).
+// Key Set (RFC 7517). A token is a JSON Web Token (RFC 7519) signed with EdDSA (RFC 8037). A token for a client key is
+// bound to it with a confirmation claim (RFC 7800).
 package signing
 
 import (
@@ -138,10 +138,6 @@ func ParsePublicKey(raw []byte) (ed25519.PublicKey, error) {
 type Options struct {
 	// Issuer is the iss claim, e.g. https://token.example.
 	Issuer string
-	// Audience is the aud claim: the server that accepts the tokens, e.g. wss://vfs.example/v1/ws.
-	Audience string
-	// TTL is the lifetime of a token.
-	TTL time.Duration
 	// Now returns the current time. nil uses time.Now.
 	Now func() time.Time
 }
@@ -194,10 +190,13 @@ func (s *Signer) JWKS() []byte {
 	return s.jwks
 }
 
-// Grant is what a token confirms: the user, the user's team (empty without one) and the client key it is bound to.
+// Grant is what a token confirms: the user, the user's team (empty without one), the server that accepts it, its
+// lifetime, and the client key it is bound to. Without a key the token has no cnf claim.
 type Grant struct {
 	Subject   string
 	Team      string
+	Audience  string
+	TTL       time.Duration
 	PublicKey ed25519.PublicKey
 }
 
@@ -217,15 +216,17 @@ func (s *Signer) Issue(g Grant) (Token, error) {
 	}
 	now := s.opts.Now().Unix()
 	c := claims{
-		Issuer:       s.opts.Issuer,
-		Audience:     s.opts.Audience,
-		Subject:      g.Subject,
-		Team:         g.Team,
-		Confirmation: confirmation{JWK: newJWK(g.PublicKey)},
-		IssuedAt:     now,
-		NotBefore:    now,
-		Expiry:       now + int64(s.opts.TTL/time.Second),
-		ID:           b64.EncodeToString(jti),
+		Issuer:    s.opts.Issuer,
+		Audience:  g.Audience,
+		Subject:   g.Subject,
+		Team:      g.Team,
+		IssuedAt:  now,
+		NotBefore: now,
+		Expiry:    now + int64(g.TTL/time.Second),
+		ID:        b64.EncodeToString(jti),
+	}
+	if g.PublicKey != nil {
+		c.Confirmation = &confirmation{JWK: newJWK(g.PublicKey)}
 	}
 	header, err := json.Marshal(jwtHeader{Alg: Algorithm, Kid: s.current, Typ: jwtType})
 	if err != nil {
@@ -251,15 +252,15 @@ type jwtHeader struct {
 }
 
 type claims struct {
-	Issuer       string       `json:"iss"`
-	Audience     string       `json:"aud"`
-	Subject      string       `json:"sub"`
-	Team         string       `json:"team,omitempty"`
-	Confirmation confirmation `json:"cnf"`
-	IssuedAt     int64        `json:"iat"`
-	NotBefore    int64        `json:"nbf"`
-	Expiry       int64        `json:"exp"`
-	ID           string       `json:"jti"`
+	Issuer       string        `json:"iss"`
+	Audience     string        `json:"aud"`
+	Subject      string        `json:"sub"`
+	Team         string        `json:"team,omitempty"`
+	Confirmation *confirmation `json:"cnf,omitempty"`
+	IssuedAt     int64         `json:"iat"`
+	NotBefore    int64         `json:"nbf"`
+	Expiry       int64         `json:"exp"`
+	ID           string        `json:"jti"`
 }
 
 type confirmation struct {
