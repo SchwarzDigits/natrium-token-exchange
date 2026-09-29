@@ -6,8 +6,12 @@ The service needs no database and no other service than the Wire backend. It kee
 instances can run side by side with the same configuration. The configuration is in the
 [README](../README.md#configuration).
 
-Expose only `/v1/token` and `/.well-known/jwks.json`. The storage server needs `/.well-known/jwks.json`; if it runs in
-the same cluster, it can fetch it there, and the key set does not have to be public at all.
+Expose only `/v1/token` and `/.well-known/jwks.json`. The storage server and the PIN service need
+`/.well-known/jwks.json`; if they run in the same cluster, they can fetch it there, and the key set does not have to be
+public at all.
+
+`STORAGE_AUDIENCE` and `PIN_AUDIENCE` must be the names the storage server and the PIN service expect as `aud`, and
+they must differ. Without `PIN_AUDIENCE` the service issues no PIN tokens.
 
 On Linux the service makes its process not dumpable and turns off core dumps at start: the signing keys are in its
 memory and its environment, and another process of the same user can then read neither through `/proc`.
@@ -29,14 +33,14 @@ A key ID has 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `-` and `_`. A date wo
 
 ### Rotating the signing keys
 
-The storage server caches the key set for up to five minutes, and tokens live for `TOKEN_TTL`. A rotation therefore
-has three steps:
+The servers cache the key set for up to five minutes, and tokens live for `STORAGE_TOKEN_TTL` or `PIN_TOKEN_TTL`. A
+rotation therefore has three steps:
 
 1. **Publish.** Create a new key and add it to `SIGNING_KEYS`, leaving `CURRENT_KEY_ID` at the old key. Deploy, then
-   wait at least five minutes, so that every storage server knows the new key.
+   wait at least five minutes, so that every server knows the new key.
 2. **Switch.** Set `CURRENT_KEY_ID` to the new key and deploy. New tokens are signed with it.
-3. **Retire.** After at least `TOKEN_TTL`, when no token of the old key is left, remove the old key from
-   `SIGNING_KEYS` and deploy.
+3. **Retire.** After at least the longer of the two lifetimes, when no token of the old key is left, remove the old
+   key from `SIGNING_KEYS` and deploy.
 
 ### A leaked signing key
 
@@ -51,8 +55,8 @@ They cannot read other clients' databases: those belong to other keys and are en
 
 `ALLOWED_TEAMS`, `DENIED_TEAMS`, `ALLOWED_USERS` and `DENIED_USERS` decide who gets tokens; the rules and examples are
 in the [README](../README.md#configuration) and in [protocol.md](protocol.md#admission). A change takes effect when the
-service restarts. A user who loses the admission keeps a token already issued until it expires, at most `TOKEN_TTL`;
-the storage server ends the connection at that time, and the next token is refused. The log at start shows the size of
+service restarts. A user who loses the admission keeps a token already issued until it expires, at most
+`STORAGE_TOKEN_TTL`; the storage server ends the connection at that time, and the next token is refused. The log at start shows the size of
 each list, or `*`.
 
 ## Limits per user
@@ -79,9 +83,10 @@ Metrics:
 | Metric | Meaning |
 |---|---|
 | `natrium_token_exchange_requests_total{result}` | requests to `/v1/token` by result: `ok`, `bad_request`, `unauthorized`, `not_allowed`, `limited`, `overloaded`, `unavailable`, `internal` |
+| `natrium_token_exchange_tokens_issued_total{audience}` | tokens issued, by audience: `storage`, `pin` |
 | `natrium_token_exchange_wire_auth_duration_seconds` | duration of the token check with Wire |
 | `natrium_token_exchange_limited_users` | users whose tokens or keys are counted against the limits |
 
-The server logs one JSON line per request to `/v1/token` with the result, the user, the team, the client's public key,
-the token's `jti` and, for a refusal by a limit, which limit (`tokens` or `keys`), as far as they are known. It never
+The server logs one JSON line per request to `/v1/token` with the result, the user, the team, the audience, the
+client's public key, the token's `jti` and, for a refusal by a limit, which limit (`tokens` or `keys`), as far as they are known. It never
 logs the Wire token or the issued token.

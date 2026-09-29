@@ -33,14 +33,21 @@ const (
 	PathMetrics = platform.PathMetrics
 )
 
-// Bounds and default of Config.TokenTTL.
+// Bounds and defaults of the token lifetimes.
 const (
-	DefaultTokenTTL = time.Hour
-	MinTokenTTL     = time.Minute
-	MaxTokenTTL     = 24 * time.Hour
+	DefaultStorageTokenTTL = time.Hour
+	DefaultPinTokenTTL     = 10 * time.Minute
+	MinTokenTTL            = time.Minute
+	MaxTokenTTL            = 24 * time.Hour
 )
 
-// maxClaimLength bounds Issuer and Audience.
+// Names of the audiences in requests.
+const (
+	AudienceStorage = "storage"
+	AudiencePin     = "pin"
+)
+
+// maxClaimLength bounds Issuer and the audiences.
 const maxClaimLength = 256
 
 // sweepInterval is the interval at which users are forgotten whose limits have run out of their windows.
@@ -78,12 +85,21 @@ type Config struct {
 	// https://nginz-https.wire.example/v15. The server checks every access token with GET /self there. Required.
 	WireAPIURL string
 
-	// Issuer is the iss claim of the tokens, e.g. https://token.example. The storage server expects it. Required.
+	// Issuer is the iss claim of the tokens, e.g. https://token.example. The servers that accept the tokens expect
+	// it. Required.
 	Issuer string
-	// Audience is the aud claim of the tokens: the storage server, e.g. wss://vfs.example/v1/ws. Required.
-	Audience string
-	// TokenTTL is the lifetime of a token, from MinTokenTTL to MaxTokenTTL.
-	TokenTTL time.Duration
+	// StorageAudience is the aud claim of the tokens for the storage server, e.g. wss://vfs.example/v1/ws. A request
+	// for them names the audience "storage" and carries the client's public key. Required.
+	StorageAudience string
+	// StorageTokenTTL is the lifetime of a storage token, from MinTokenTTL to MaxTokenTTL.
+	StorageTokenTTL time.Duration
+	// PinAudience is the aud claim of the tokens for the PIN service, e.g. https://pin.example. A request for them
+	// names the audience "pin" and carries no key: a browser that restores its key file has no key yet. Empty: the
+	// service issues no PIN tokens. It must differ from StorageAudience, so that neither server accepts the other's
+	// tokens.
+	PinAudience string
+	// PinTokenTTL is the lifetime of a PIN token, from MinTokenTTL to MaxTokenTTL.
+	PinTokenTTL time.Duration
 
 	// SigningKeys are the keys in the key set. Required.
 	SigningKeys []SigningKey
@@ -119,11 +135,12 @@ func (c Config) rules() allow.Rules {
 	}
 }
 
-// DefaultConfig returns the default token lifetime of one hour and the default limits. The other required fields are
+// DefaultConfig returns the default token lifetimes and limits. The other required fields are
 // left to the caller.
 func DefaultConfig() Config {
 	return Config{
-		TokenTTL:                DefaultTokenTTL,
+		StorageTokenTTL:         DefaultStorageTokenTTL,
+		PinTokenTTL:             DefaultPinTokenTTL,
 		TokenLimit:              DefaultTokenLimit,
 		KeyLimit:                DefaultKeyLimit,
 		MaxConcurrentWireChecks: DefaultMaxConcurrentWireChecks,
@@ -159,11 +176,22 @@ func (c Config) Validate() error {
 	if err := checkClaim(c.Issuer); err != nil {
 		return invalid("Issuer", "%v, e.g. https://token.example", err)
 	}
-	if err := checkClaim(c.Audience); err != nil {
-		return invalid("Audience", "%v, e.g. wss://vfs.example/v1/ws", err)
+	if err := checkClaim(c.StorageAudience); err != nil {
+		return invalid("StorageAudience", "%v, e.g. wss://vfs.example/v1/ws", err)
 	}
-	if c.TokenTTL < MinTokenTTL || c.TokenTTL > MaxTokenTTL || c.TokenTTL%time.Second != 0 {
-		return invalid("TokenTTL", "must be whole seconds from %s to %s, got %s", MinTokenTTL, MaxTokenTTL, c.TokenTTL)
+	if err := checkTTL(c.StorageTokenTTL); err != nil {
+		return invalid("StorageTokenTTL", "%v", err)
+	}
+	if c.PinAudience != "" {
+		if err := checkClaim(c.PinAudience); err != nil {
+			return invalid("PinAudience", "%v, e.g. https://pin.example", err)
+		}
+		if c.PinAudience == c.StorageAudience {
+			return invalid("PinAudience", "must differ from StorageAudience")
+		}
+		if err := checkTTL(c.PinTokenTTL); err != nil {
+			return invalid("PinTokenTTL", "%v", err)
+		}
 	}
 	switch {
 	case len(c.SigningKeys) == 0:
@@ -205,6 +233,25 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// checkTTL reports whether d is whole seconds from MinTokenTTL to MaxTokenTTL.
+func checkTTL(d time.Duration) error {
+	if d < MinTokenTTL || d > MaxTokenTTL || d%time.Second != 0 {
+		return fmt.Errorf("must be whole seconds from %s to %s, got %s", MinTokenTTL, MaxTokenTTL, d)
+	}
+	return nil
+}
+
+// audiences returns the kinds of token c configures.
+func (c Config) audiences() map[string]httpapi.Audience {
+	a := map[string]httpapi.Audience{
+		AudienceStorage: {Aud: c.StorageAudience, TTL: c.StorageTokenTTL, Key: true},
+	}
+	if c.PinAudience != "" {
+		a[AudiencePin] = httpapi.Audience{Aud: c.PinAudience, TTL: c.PinTokenTTL}
+	}
+	return a
+}
+
 // checkClaim reports whether s can be a claim: 1 to 256 printable ASCII characters without spaces.
 func checkClaim(s string) error {
 	if s == "" || len(s) > maxClaimLength {
@@ -244,11 +291,7 @@ func run(ctx context.Context, cfg Config, log *slog.Logger, deps dependencies) e
 	if err != nil {
 		return invalid("WireAPIURL", "%v", err)
 	}
-	signer, err := signing.New(cfg.SigningKeys, cfg.CurrentKeyID, signing.Options{
-		Issuer:   cfg.Issuer,
-		Audience: cfg.Audience,
-		TTL:      cfg.TokenTTL,
-	})
+	signer, err := signing.New(cfg.SigningKeys, cfg.CurrentKeyID, signing.Options{Issuer: cfg.Issuer})
 	if err != nil {
 		return invalid("SigningKeys", "%v", err)
 	}
@@ -283,6 +326,7 @@ func run(ctx context.Context, cfg Config, log *slog.Logger, deps dependencies) e
 		Allow:               list,
 		Signer:              signer,
 		Limits:              limiter,
+		Audiences:           cfg.audiences(),
 		MaxConcurrentChecks: cfg.MaxConcurrentWireChecks,
 		Log:                 log,
 		Metrics:             registry,
@@ -292,7 +336,9 @@ func run(ctx context.Context, cfg Config, log *slog.Logger, deps dependencies) e
 	mux.Handle("GET "+PathMetrics, platform.MetricsHandler(registry))
 
 	log.Info("starting server", append([]any{"addr", cfg.Addr, "wire_api_url", cfg.WireAPIURL, "issuer", cfg.Issuer,
-		"audience", cfg.Audience, "token_ttl", cfg.TokenTTL.String(), "signing_keys", len(cfg.SigningKeys),
+		"storage_audience", cfg.StorageAudience, "storage_token_ttl", cfg.StorageTokenTTL.String(),
+		"pin_audience", cfg.PinAudience, "pin_token_ttl", cfg.PinTokenTTL.String(),
+		"signing_keys", len(cfg.SigningKeys),
 		"current_key_id", cfg.CurrentKeyID, "token_limit", cfg.TokenLimit.String(), "key_limit", cfg.KeyLimit.String(),
 		"max_concurrent_wire_checks", cfg.MaxConcurrentWireChecks}, list.LogAttrs()...)...)
 	return platform.Serve(ctx, log, cfg.Addr, platform.Recover(log, mux))

@@ -34,7 +34,8 @@ func valid() Config {
 	cfg.Addr = ":8080"
 	cfg.WireAPIURL = "https://nginz-https.wire.example/v15"
 	cfg.Issuer = "https://token.example"
-	cfg.Audience = "wss://vfs.example/v1/ws"
+	cfg.StorageAudience = "wss://vfs.example/v1/ws"
+	cfg.PinAudience = "https://pin.example"
 	cfg.SigningKeys = []SigningKey{{ID: "k1", Seed: seed(1)}}
 	cfg.CurrentKeyID = "k1"
 	cfg.AllowedTeams = []string{team}
@@ -43,7 +44,8 @@ func valid() Config {
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
-	require.Equal(t, time.Hour, cfg.TokenTTL)
+	require.Equal(t, time.Hour, cfg.StorageTokenTTL)
+	require.Equal(t, 10*time.Minute, cfg.PinTokenTTL)
 	require.Equal(t, Limit{N: 60, Window: time.Hour}, cfg.TokenLimit)
 	require.Equal(t, Limit{N: 10, Window: 24 * time.Hour}, cfg.KeyLimit)
 	require.Equal(t, 64, cfg.MaxConcurrentWireChecks)
@@ -60,12 +62,15 @@ func TestValidateNamesTheField(t *testing.T) {
 		{"WireAPIURL", func(c *Config) { c.WireAPIURL = "http://nginz-https.wire.example/v15" }},
 		{"Issuer", func(c *Config) { c.Issuer = "" }},
 		{"Issuer", func(c *Config) { c.Issuer = "with space" }},
-		{"Audience", func(c *Config) { c.Audience = "" }},
-		{"Audience", func(c *Config) { c.Audience = strings.Repeat("a", maxClaimLength+1) }},
-		{"TokenTTL", func(c *Config) { c.TokenTTL = 0 }},
-		{"TokenTTL", func(c *Config) { c.TokenTTL = 59 * time.Second }},
-		{"TokenTTL", func(c *Config) { c.TokenTTL = 25 * time.Hour }},
-		{"TokenTTL", func(c *Config) { c.TokenTTL = time.Hour + time.Millisecond }},
+		{"StorageAudience", func(c *Config) { c.StorageAudience = "" }},
+		{"StorageAudience", func(c *Config) { c.StorageAudience = strings.Repeat("a", maxClaimLength+1) }},
+		{"StorageTokenTTL", func(c *Config) { c.StorageTokenTTL = 0 }},
+		{"StorageTokenTTL", func(c *Config) { c.StorageTokenTTL = 59 * time.Second }},
+		{"StorageTokenTTL", func(c *Config) { c.StorageTokenTTL = 25 * time.Hour }},
+		{"StorageTokenTTL", func(c *Config) { c.StorageTokenTTL = time.Hour + time.Millisecond }},
+		{"PinAudience", func(c *Config) { c.PinAudience = "with space" }},
+		{"PinAudience", func(c *Config) { c.PinAudience = c.StorageAudience }},
+		{"PinTokenTTL", func(c *Config) { c.PinTokenTTL = 30 * time.Second }},
 		{"SigningKeys", func(c *Config) { c.SigningKeys = nil }},
 		{"SigningKeys", func(c *Config) { c.SigningKeys = []SigningKey{{ID: "k1", Seed: []byte{1}}} }},
 		{"SigningKeys", func(c *Config) {
@@ -90,6 +95,15 @@ func TestValidateNamesTheField(t *testing.T) {
 		require.ErrorAs(t, err, &ce, tc.field)
 		require.Equal(t, tc.field, ce.Field, err.Error())
 	}
+}
+
+func TestPinAudienceIsOptional(t *testing.T) {
+	cfg := valid()
+	cfg.PinAudience = ""
+	cfg.PinTokenTTL = 0
+	require.NoError(t, cfg.Validate(), "without a PIN audience its lifetime does not matter")
+	require.NotContains(t, cfg.audiences(), AudiencePin)
+	require.Contains(t, valid().audiences(), AudiencePin)
 }
 
 func TestValidAdmissionLists(t *testing.T) {
@@ -159,7 +173,7 @@ func TestRunExchangesATokenEndToEnd(t *testing.T) {
 	client, _, err := ed25519.GenerateKey(nil)
 	require.NoError(t, err)
 	req, err := http.NewRequest(http.MethodPost, base+PathToken,
-		strings.NewReader(`{"publicKey":"`+base64.RawURLEncoding.EncodeToString(client)+`"}`))
+		strings.NewReader(`{"audience":"storage","publicKey":"`+base64.RawURLEncoding.EncodeToString(client)+`"}`))
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer wire-token")
 	resp, err := http.DefaultClient.Do(req)
@@ -191,7 +205,7 @@ func TestRunExchangesATokenEndToEnd(t *testing.T) {
 			}
 		}
 		return nil, errors.New("unknown kid")
-	}, jwt.WithValidMethods([]string{"EdDSA"}), jwt.WithIssuer(cfg.Issuer), jwt.WithAudience(cfg.Audience))
+	}, jwt.WithValidMethods([]string{"EdDSA"}), jwt.WithIssuer(cfg.Issuer), jwt.WithAudience(cfg.StorageAudience))
 	require.NoError(t, err)
 	require.Equal(t, "new", parsed.Header["kid"])
 	require.Equal(t, aliceID+"@wire.example", parsed.Claims.(jwt.MapClaims)["sub"])

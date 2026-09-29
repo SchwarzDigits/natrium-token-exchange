@@ -1,5 +1,6 @@
 // Package httpapi serves the token exchange: POST /v1/token checks the Wire token, the admission of its user, the
-// client's public key and the user's limits, and returns a signed token bound to that key. GET /.well-known/jwks.json
+// requested audience with the client's public key where the audience needs one, and the user's limits, and returns a
+// signed token for that audience. GET /.well-known/jwks.json
 // publishes the keys that verify the tokens.
 //
 // Only a bounded number of token checks with Wire run at once. A request beyond that is refused at once with 503, so a
@@ -101,12 +102,25 @@ type Limiter interface {
 	Take(user, key string, now time.Time) limits.Decision
 }
 
+// Audience is a kind of token that a request names in its audience field.
+type Audience struct {
+	// Aud is the aud claim: the server that accepts the token.
+	Aud string
+	// TTL is the lifetime of the token.
+	TTL time.Duration
+	// Key tells whether a request must carry the client's public key, which the token is then bound to. A request for
+	// an audience without a key must not carry one.
+	Key bool
+}
+
 // Options configure the handler. All fields are required, except Now.
 type Options struct {
 	Auth   Authenticator
 	Allow  Admitter
 	Signer Signer
 	Limits Limiter
+	// Audiences are the kinds of token the service issues, by the name a request uses.
+	Audiences map[string]Audience
 	// MaxConcurrentChecks bounds the token checks with Wire that run at once. At least 1.
 	MaxConcurrentChecks int
 	Log                 *slog.Logger
@@ -120,6 +134,7 @@ type Handler struct {
 	opts     Options
 	checks   chan struct{}
 	requests *prometheus.CounterVec
+	issued   *prometheus.CounterVec
 	wireAuth prometheus.Histogram
 }
 
@@ -135,6 +150,10 @@ func New(opts Options) *Handler {
 			Name: "natrium_token_exchange_requests_total",
 			Help: "Requests to " + PathToken + " by result.",
 		}, []string{"result"}),
+		issued: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "natrium_token_exchange_tokens_issued_total",
+			Help: "Tokens issued, by audience.",
+		}, []string{"audience"}),
 		wireAuth: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "natrium_token_exchange_wire_auth_duration_seconds",
 			Help:    "Duration of the token check with the Wire backend.",
@@ -144,7 +163,10 @@ func New(opts Options) *Handler {
 	for _, r := range results {
 		h.requests.WithLabelValues(r)
 	}
-	opts.Metrics.MustRegister(h.requests, h.wireAuth)
+	for name := range opts.Audiences {
+		h.issued.WithLabelValues(name)
+	}
+	opts.Metrics.MustRegister(h.requests, h.issued, h.wireAuth)
 	return h
 }
 
@@ -156,6 +178,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 }
 
 type tokenRequest struct {
+	Audience  *string `json:"audience"`
 	PublicKey *string `json:"publicKey"`
 }
 
@@ -166,12 +189,13 @@ type tokenResponse struct {
 
 // outcome is what a request logs.
 type outcome struct {
-	result string
-	user   wireauth.User
-	key    string
-	jti    string
-	limit  string
-	err    error
+	result   string
+	user     wireauth.User
+	audience string
+	key      string
+	jti      string
+	limit    string
+	err      error
 }
 
 func (h *Handler) token(w http.ResponseWriter, r *http.Request) {
@@ -186,6 +210,9 @@ func (h *Handler) token(w http.ResponseWriter, r *http.Request) {
 	}
 	if o.user.Team != "" {
 		attrs = append(attrs, "team", o.user.Team)
+	}
+	if o.audience != "" {
+		attrs = append(attrs, "audience", o.audience)
 	}
 	if o.key != "" {
 		attrs = append(attrs, "key", o.key)
@@ -206,7 +233,7 @@ func (h *Handler) token(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// serve answers the request in the order: token, admission, body and key, limits, issue.
+// serve answers the request in the order: token, admission, body with audience and key, limits, issue.
 func (h *Handler) serve(w http.ResponseWriter, r *http.Request) outcome {
 	token, ok := bearerToken(r)
 	if !ok {
@@ -236,13 +263,16 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) outcome {
 		return o
 	}
 
-	key, err := readRequest(w, r)
+	name, audience, key, err := h.readRequest(w, r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, codeBadRequest)
-		o.result = resultBadRequest
+		o.result, o.err = resultBadRequest, err
 		return o
 	}
-	o.key = base64.RawURLEncoding.EncodeToString(key)
+	o.audience = name
+	if key != nil {
+		o.key = base64.RawURLEncoding.EncodeToString(key)
+	}
 
 	if d := h.opts.Limits.Take(user.String(), o.key, h.opts.Now()); !d.Allowed {
 		w.Header().Set("Retry-After", retryAfterSeconds(d.RetryAfter))
@@ -251,12 +281,19 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) outcome {
 		return o
 	}
 
-	issued, err := h.opts.Signer.Issue(signing.Grant{Subject: user.String(), Team: user.Team, PublicKey: key})
+	issued, err := h.opts.Signer.Issue(signing.Grant{
+		Subject:   user.String(),
+		Team:      user.Team,
+		Audience:  audience.Aud,
+		TTL:       audience.TTL,
+		PublicKey: key,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, codeInternal)
 		o.result, o.err = resultInternal, err
 		return o
 	}
+	h.issued.WithLabelValues(name).Inc()
 	writeJSON(w, http.StatusOK, tokenResponse{Token: issued.JWT, ExpiresIn: int64(issued.ExpiresIn / time.Second)})
 	o.result, o.jti = resultOK, issued.ID
 	return o
@@ -294,30 +331,47 @@ func bearerToken(r *http.Request) (string, bool) {
 	return token, true
 }
 
-// readRequest decodes the body strictly: one JSON object with known fields and nothing after it, and a public key in
-// base64url without padding that is a usable Ed25519 public key.
-func readRequest(w http.ResponseWriter, r *http.Request) (ed25519.PublicKey, error) {
+// readRequest decodes the body strictly: one JSON object with known fields and nothing after it, a configured
+// audience, and, exactly when the audience needs one, a public key in base64url without padding that is a usable
+// Ed25519 public key. It returns the audience's name and configuration, and the key or nil.
+func (h *Handler) readRequest(w http.ResponseWriter, r *http.Request) (string, Audience, ed25519.PublicKey, error) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
-		return nil, err
+		return "", Audience{}, nil, err
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	var req tokenRequest
 	if err := dec.Decode(&req); err != nil {
-		return nil, err
+		return "", Audience{}, nil, err
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, errors.New("data after the JSON object")
+		return "", Audience{}, nil, errors.New("data after the JSON object")
 	}
-	if req.PublicKey == nil {
-		return nil, errors.New("publicKey is missing")
+	if req.Audience == nil {
+		return "", Audience{}, nil, errors.New("audience is missing")
+	}
+	audience, ok := h.opts.Audiences[*req.Audience]
+	if !ok {
+		return "", Audience{}, nil, errors.New("unknown audience")
+	}
+	switch {
+	case !audience.Key && req.PublicKey != nil:
+		return "", Audience{}, nil, errors.New("publicKey is not allowed for this audience")
+	case !audience.Key:
+		return *req.Audience, audience, nil, nil
+	case req.PublicKey == nil:
+		return "", Audience{}, nil, errors.New("publicKey is missing")
 	}
 	raw, err := base64.RawURLEncoding.Strict().DecodeString(*req.PublicKey)
 	if err != nil {
-		return nil, err
+		return "", Audience{}, nil, errors.New("publicKey is not base64url without padding")
 	}
-	return signing.ParsePublicKey(raw)
+	key, err := signing.ParsePublicKey(raw)
+	if err != nil {
+		return "", Audience{}, nil, err
+	}
+	return *req.Audience, audience, key, nil
 }
 
 func (h *Handler) jwks(w http.ResponseWriter, _ *http.Request) {

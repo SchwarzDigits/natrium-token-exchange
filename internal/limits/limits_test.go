@@ -121,3 +121,13 @@ func TestNewChecksTheLimits(t *testing.T) {
 	_, err = New(Limit{N: 1, Window: time.Hour}, Limit{N: 1, Window: 0})
 	require.Error(t, err)
 }
+
+func TestTokensWithoutKeyCountOnlyAsTokens(t *testing.T) {
+	l := newLimiter(t, Limit{N: 3, Window: time.Hour}, Limit{N: 1, Window: 24 * time.Hour})
+	require.True(t, l.Take("alice", "k1", start).Allowed)
+	require.True(t, l.Take("alice", "", start).Allowed, "no key, so the full key limit does not apply")
+	require.True(t, l.Take("alice", "", start).Allowed)
+	d := l.Take("alice", "", start)
+	require.False(t, d.Allowed)
+	require.Equal(t, ReasonTokens, d.Reason)
+}
