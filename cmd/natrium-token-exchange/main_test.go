@@ -13,7 +13,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/SchwarzDigits/natrium-token-exchange/internal/config"
+	"github.com/SchwarzDigits/natrium-token-exchange/config"
 	"github.com/SchwarzDigits/natrium-token-exchange/server"
 )
 

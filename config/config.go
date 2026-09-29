@@ -1,5 +1,8 @@
 // Package config reads the NATRIUM_TOKEN_EXCHANGE_* environment variables of the command. No other package reads the
 // environment. Load parses them into a server.Config, validates it and names the variable in every error.
+//
+// A program that receives the settings under other names, e.g. from a platform, calls LoadFrom with a function that
+// translates the names.
 package config
 
 import (
@@ -72,11 +75,16 @@ type Config struct {
 
 // Load reads and validates the environment variables.
 func Load() (Config, error) {
+	return LoadFrom(os.Getenv)
+}
+
+// LoadFrom reads and validates the variables through getenv, which returns "" for an unset variable.
+func LoadFrom(getenv func(string) string) (Config, error) {
 	cfg := Config{Server: server.DefaultConfig(), LogLevel: slog.LevelInfo}
 	s := &cfg.Server
 
 	port := defaultPort
-	if v := os.Getenv(EnvPort); v != "" {
+	if v := getenv(EnvPort); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > 65535 {
 			return Config{}, fmt.Errorf("%s: must be a port from 1 to 65535, got %q", EnvPort, v)
@@ -85,21 +93,21 @@ func Load() (Config, error) {
 	}
 	s.Addr = fmt.Sprintf(":%d", port)
 
-	if v := os.Getenv(EnvLogLevel); v != "" {
+	if v := getenv(EnvLogLevel); v != "" {
 		if err := cfg.LogLevel.UnmarshalText([]byte(v)); err != nil {
 			return Config{}, fmt.Errorf("%s: %w", EnvLogLevel, err)
 		}
 	}
 
-	s.WireAPIURL = os.Getenv(EnvWireAPIURL)
-	s.Issuer = os.Getenv(EnvIssuer)
-	s.StorageAudience = os.Getenv(EnvStorageAudience)
-	s.PinAudience = os.Getenv(EnvPinAudience)
+	s.WireAPIURL = getenv(EnvWireAPIURL)
+	s.Issuer = getenv(EnvIssuer)
+	s.StorageAudience = getenv(EnvStorageAudience)
+	s.PinAudience = getenv(EnvPinAudience)
 	for _, v := range []struct {
 		name string
 		ttl  *time.Duration
 	}{{EnvStorageTokenTTL, &s.StorageTokenTTL}, {EnvPinTokenTTL, &s.PinTokenTTL}} {
-		if raw := os.Getenv(v.name); raw != "" {
+		if raw := getenv(v.name); raw != "" {
 			d, err := time.ParseDuration(raw)
 			if err != nil {
 				return Config{}, fmt.Errorf("%s: must be a duration such as 1h or 10m, got %q", v.name, raw)
@@ -107,23 +115,23 @@ func Load() (Config, error) {
 			*v.ttl = d
 		}
 	}
-	if v := os.Getenv(EnvSigningKeys); v != "" {
+	if v := getenv(EnvSigningKeys); v != "" {
 		keys, err := server.ParseSigningKeys(v)
 		if err != nil {
 			return Config{}, fmt.Errorf("%s: %w", EnvSigningKeys, err)
 		}
 		s.SigningKeys = keys
 	}
-	s.CurrentKeyID = os.Getenv(EnvCurrentKeyID)
-	s.AllowedTeams = allow.Split(os.Getenv(EnvAllowedTeams))
-	s.DeniedTeams = allow.Split(os.Getenv(EnvDeniedTeams))
-	s.AllowedUsers = allow.Split(os.Getenv(EnvAllowedUsers))
-	s.DeniedUsers = allow.Split(os.Getenv(EnvDeniedUsers))
+	s.CurrentKeyID = getenv(EnvCurrentKeyID)
+	s.AllowedTeams = allow.Split(getenv(EnvAllowedTeams))
+	s.DeniedTeams = allow.Split(getenv(EnvDeniedTeams))
+	s.AllowedUsers = allow.Split(getenv(EnvAllowedUsers))
+	s.DeniedUsers = allow.Split(getenv(EnvDeniedUsers))
 	for _, v := range []struct {
 		name  string
 		limit *server.Limit
 	}{{EnvTokenLimit, &s.TokenLimit}, {EnvKeyLimit, &s.KeyLimit}} {
-		if raw := os.Getenv(v.name); raw != "" {
+		if raw := getenv(v.name); raw != "" {
 			l, err := server.ParseLimit(raw)
 			if err != nil {
 				return Config{}, fmt.Errorf("%s: %w", v.name, err)
@@ -131,7 +139,7 @@ func Load() (Config, error) {
 			*v.limit = l
 		}
 	}
-	if v := os.Getenv(EnvMaxConcurrentWireChecks); v != "" {
+	if v := getenv(EnvMaxConcurrentWireChecks); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
 			return Config{}, fmt.Errorf("%s: must be a number, got %q", EnvMaxConcurrentWireChecks, v)
