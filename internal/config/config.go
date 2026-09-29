@@ -32,6 +32,10 @@ const (
 	// EnvAllowedUsers and EnvDeniedUsers are comma-separated lists of qualified user IDs, <uuid>@<domain>, or "*".
 	EnvAllowedUsers = "NATRIUM_TOKEN_EXCHANGE_ALLOWED_USERS"
 	EnvDeniedUsers  = "NATRIUM_TOKEN_EXCHANGE_DENIED_USERS"
+	// EnvTokenLimit and EnvKeyLimit have the form <n>/<window>, e.g. 60/1h.
+	EnvTokenLimit              = "NATRIUM_TOKEN_EXCHANGE_TOKEN_LIMIT"
+	EnvKeyLimit                = "NATRIUM_TOKEN_EXCHANGE_KEY_LIMIT"
+	EnvMaxConcurrentWireChecks = "NATRIUM_TOKEN_EXCHANGE_MAX_CONCURRENT_WIRE_CHECKS"
 )
 
 const defaultPort = 8080
@@ -49,6 +53,10 @@ var envOf = map[string]string{
 	"DeniedTeams":  EnvDeniedTeams,
 	"AllowedUsers": EnvAllowedUsers,
 	"DeniedUsers":  EnvDeniedUsers,
+
+	"TokenLimit":              EnvTokenLimit,
+	"KeyLimit":                EnvKeyLimit,
+	"MaxConcurrentWireChecks": EnvMaxConcurrentWireChecks,
 }
 
 // Config is the configuration of the command.
@@ -100,6 +108,25 @@ func Load() (Config, error) {
 	s.DeniedTeams = allow.Split(os.Getenv(EnvDeniedTeams))
 	s.AllowedUsers = allow.Split(os.Getenv(EnvAllowedUsers))
 	s.DeniedUsers = allow.Split(os.Getenv(EnvDeniedUsers))
+	for _, v := range []struct {
+		name  string
+		limit *server.Limit
+	}{{EnvTokenLimit, &s.TokenLimit}, {EnvKeyLimit, &s.KeyLimit}} {
+		if raw := os.Getenv(v.name); raw != "" {
+			l, err := server.ParseLimit(raw)
+			if err != nil {
+				return Config{}, fmt.Errorf("%s: %w", v.name, err)
+			}
+			*v.limit = l
+		}
+	}
+	if v := os.Getenv(EnvMaxConcurrentWireChecks); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: must be a number, got %q", EnvMaxConcurrentWireChecks, v)
+		}
+		s.MaxConcurrentWireChecks = n
+	}
 
 	if err := s.Validate(); err != nil {
 		return Config{}, Named(err)

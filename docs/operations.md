@@ -9,6 +9,16 @@ instances can run side by side with the same configuration. The configuration is
 Expose only `/v1/token` and `/.well-known/jwks.json`. The storage server needs `/.well-known/jwks.json`; if it runs in
 the same cluster, it can fetch it there, and the key set does not have to be public at all.
 
+On Linux the service makes its process not dumpable and turns off core dumps at start: the signing keys are in its
+memory and its environment, and another process of the same user can then read neither through `/proc`.
+
+### Limits by address
+
+The service limits per user, after the token check, and bounds the checks that run at once. It does not limit per
+client address, because behind a reverse proxy it cannot tell addresses apart reliably. Limit requests per address at
+the ingress in front of it, e.g. with `limit-rps` of the NGINX ingress controller. A client needs a few requests per
+hour; 1 request per second with a burst of 10 per address leaves ample room.
+
 ## Signing keys
 
 A signing key is an Ed25519 seed of 32 bytes with a key ID. `new-signing-key -key-id <id>` creates one and prints its
@@ -45,6 +55,17 @@ service restarts. A user who loses the admission keeps a token already issued un
 the storage server ends the connection at that time, and the next token is refused. The log at start shows the size of
 each list, or `*`.
 
+## Limits per user
+
+`TOKEN_LIMIT` and `KEY_LIMIT` bound what one user gets from one instance; the rules are in
+[protocol.md](protocol.md#limits). The counts are in memory, so a restart resets them, and with several instances each
+counts on its own. If users of a large team share one address, the per-address limit at the ingress, not these, is the
+one to raise.
+
+`MAX_CONCURRENT_WIRE_CHECKS` bounds the token checks with Wire per instance. A check normally takes a few tens of
+milliseconds, so the default of 64 allows about a thousand requests per second per instance. Requests beyond it are
+counted as `overloaded` in the metrics.
+
 ## Probes, metrics and logs
 
 | Path | Behaviour |
@@ -57,8 +78,10 @@ Metrics:
 
 | Metric | Meaning |
 |---|---|
-| `natrium_token_exchange_requests_total{result}` | requests to `/v1/token` by result: `ok`, `bad_request`, `unauthorized`, `not_allowed`, `unavailable`, `internal` |
+| `natrium_token_exchange_requests_total{result}` | requests to `/v1/token` by result: `ok`, `bad_request`, `unauthorized`, `not_allowed`, `limited`, `overloaded`, `unavailable`, `internal` |
 | `natrium_token_exchange_wire_auth_duration_seconds` | duration of the token check with Wire |
+| `natrium_token_exchange_limited_users` | users whose tokens or keys are counted against the limits |
 
-The server logs one JSON line per request to `/v1/token` with the result, the user, the team, the client's public key
-and the token's `jti`, as far as they are known. It never logs the Wire token or the issued token.
+The server logs one JSON line per request to `/v1/token` with the result, the user, the team, the client's public key,
+the token's `jti` and, for a refusal by a limit, which limit (`tokens` or `keys`), as far as they are known. It never
+logs the Wire token or the issued token.

@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/SchwarzDigits/natrium-token-exchange/internal/allow"
+	"github.com/SchwarzDigits/natrium-token-exchange/internal/limits"
 	"github.com/SchwarzDigits/natrium-token-exchange/internal/signing"
 	"github.com/SchwarzDigits/natrium-token-exchange/internal/wireauth"
 )
@@ -41,9 +42,16 @@ type fakeAuth struct {
 	calls int
 	user  wireauth.User
 	err   error
+	// entered and release, if set, hold every check until release is closed.
+	entered chan struct{}
+	release chan struct{}
 }
 
 func (f *fakeAuth) Authenticate(_ context.Context, t string) (wireauth.User, error) {
+	if f.release != nil {
+		f.entered <- struct{}{}
+		<-f.release
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -68,7 +76,11 @@ type fixture struct {
 	signer  *signing.Signer
 	logs    *bytes.Buffer
 	api     *Handler
+	now     time.Time
 }
+
+// maxChecks is the bound of concurrent token checks in the fixture.
+const maxChecks = 2
 
 func newFixture(t *testing.T, sign func(*signing.Signer) Signer) *fixture {
 	t.Helper()
@@ -83,17 +95,23 @@ func newFixture(t *testing.T, sign func(*signing.Signer) Signer) *fixture {
 		}},
 		signer: signer,
 		logs:   &bytes.Buffer{},
+		now:    time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC),
 	}
 	var s Signer = signer
 	if sign != nil {
 		s = sign(signer)
 	}
+	limiter, err := limits.New(limits.Limit{N: 3, Window: time.Hour}, limits.Limit{N: 2, Window: 24 * time.Hour})
+	require.NoError(t, err)
 	f.api = New(Options{
-		Auth:    f.auth,
-		Allow:   list,
-		Signer:  s,
-		Log:     slog.New(slog.NewJSONHandler(f.logs, nil)),
-		Metrics: prometheus.NewRegistry(),
+		Auth:                f.auth,
+		Allow:               list,
+		Signer:              s,
+		Limits:              limiter,
+		MaxConcurrentChecks: maxChecks,
+		Log:                 slog.New(slog.NewJSONHandler(f.logs, nil)),
+		Metrics:             prometheus.NewRegistry(),
+		Now:                 func() time.Time { return f.now },
 	})
 	mux := http.NewServeMux()
 	f.api.Register(mux)
@@ -144,6 +162,7 @@ func TestIssuesATokenBoundToTheClientKey(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
 	require.Equal(t, "*", rec.Header().Get("Access-Control-Allow-Origin"))
+	require.Equal(t, "Retry-After", rec.Header().Get("Access-Control-Expose-Headers"))
 
 	var resp struct {
 		Token     string `json:"token"`
@@ -268,4 +287,57 @@ func TestServesTheKeySet(t *testing.T) {
 	require.Equal(t, jwksCacheControl, rec.Header().Get("Cache-Control"))
 	require.Equal(t, "*", rec.Header().Get("Access-Control-Allow-Origin"))
 	require.JSONEq(t, string(f.signer.JWKS()), rec.Body.String())
+}
+
+func TestLimitsTokensPerUser(t *testing.T) {
+	f := newFixture(t, nil)
+	key := clientKey(t)
+	for range 3 {
+		require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(key)).Code)
+	}
+	f.now = f.now.Add(10 * time.Minute)
+	rec := f.post(t, "Bearer "+wireToken, body(key))
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	require.Equal(t, codeTooManyRequests, errorCode(t, rec))
+	require.Equal(t, "3000", rec.Header().Get("Retry-After"), "50 minutes until the first token leaves the window")
+	require.EqualValues(t, 1, f.count(resultLimited))
+	require.Contains(t, f.logs.String(), `"limit":"tokens"`)
+
+	f.now = f.now.Add(50 * time.Minute)
+	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(key)).Code)
+}
+
+func TestLimitsKeysPerUser(t *testing.T) {
+	f := newFixture(t, nil)
+	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(clientKey(t))).Code)
+	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(clientKey(t))).Code)
+	rec := f.post(t, "Bearer "+wireToken, body(clientKey(t)))
+	require.Equal(t, http.StatusTooManyRequests, rec.Code)
+	require.Equal(t, "86400", rec.Header().Get("Retry-After"))
+	require.Contains(t, f.logs.String(), `"limit":"keys"`)
+}
+
+func TestBoundsConcurrentChecks(t *testing.T) {
+	f := newFixture(t, nil)
+	f.auth.entered = make(chan struct{})
+	f.auth.release = make(chan struct{})
+	key := clientKey(t)
+
+	codes := make(chan int, maxChecks)
+	for range maxChecks {
+		go func() { codes <- f.post(t, "Bearer "+wireToken, body(key)).Code }()
+		<-f.auth.entered
+	}
+	rec := f.post(t, "Bearer "+wireToken, body(key))
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code, "a check beyond the bound is refused at once")
+	require.Equal(t, codeUnavailable, errorCode(t, rec))
+	require.Equal(t, "1", rec.Header().Get("Retry-After"))
+	require.EqualValues(t, 1, f.count(resultOverloaded))
+
+	close(f.auth.release)
+	for range maxChecks {
+		require.Equal(t, http.StatusOK, <-codes)
+	}
+	f.auth.release = nil
+	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(key)).Code, "the slots are free again")
 }

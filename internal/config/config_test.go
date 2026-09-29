@@ -28,7 +28,8 @@ func setValid(t *testing.T) {
 	t.Setenv(EnvSigningKeys, "k1:"+seed)
 	t.Setenv(EnvCurrentKeyID, "k1")
 	t.Setenv(EnvAllowedTeams, team)
-	for _, name := range []string{EnvPort, EnvLogLevel, EnvTokenTTL, EnvDeniedTeams, EnvAllowedUsers, EnvDeniedUsers} {
+	for _, name := range []string{EnvPort, EnvLogLevel, EnvTokenTTL, EnvDeniedTeams, EnvAllowedUsers, EnvDeniedUsers,
+		EnvTokenLimit, EnvKeyLimit, EnvMaxConcurrentWireChecks} {
 		t.Setenv(name, "")
 	}
 }
@@ -40,6 +41,9 @@ func TestLoadDefaults(t *testing.T) {
 	require.Equal(t, ":8080", cfg.Server.Addr)
 	require.Equal(t, slog.LevelInfo, cfg.LogLevel)
 	require.Equal(t, time.Hour, cfg.Server.TokenTTL)
+	require.Equal(t, server.DefaultTokenLimit, cfg.Server.TokenLimit)
+	require.Equal(t, server.DefaultKeyLimit, cfg.Server.KeyLimit)
+	require.Equal(t, server.DefaultMaxConcurrentWireChecks, cfg.Server.MaxConcurrentWireChecks)
 	require.Equal(t, []string{team}, cfg.Server.AllowedTeams)
 	require.Nil(t, cfg.Server.AllowedUsers)
 	require.Equal(t, "k1", cfg.Server.CurrentKeyID)
@@ -55,6 +59,9 @@ func TestLoadAll(t *testing.T) {
 	t.Setenv(EnvDeniedTeams, team)
 	t.Setenv(EnvAllowedUsers, alice+", "+alice)
 	t.Setenv(EnvDeniedUsers, "*")
+	t.Setenv(EnvTokenLimit, "20/30m")
+	t.Setenv(EnvKeyLimit, "3/48h")
+	t.Setenv(EnvMaxConcurrentWireChecks, "8")
 	cfg, err := Load()
 	require.NoError(t, err)
 	require.Equal(t, ":9090", cfg.Server.Addr)
@@ -64,6 +71,9 @@ func TestLoadAll(t *testing.T) {
 	require.Equal(t, []string{team}, cfg.Server.DeniedTeams)
 	require.Equal(t, []string{alice, alice}, cfg.Server.AllowedUsers)
 	require.Equal(t, []string{"*"}, cfg.Server.DeniedUsers)
+	require.Equal(t, server.Limit{N: 20, Window: 30 * time.Minute}, cfg.Server.TokenLimit)
+	require.Equal(t, server.Limit{N: 3, Window: 48 * time.Hour}, cfg.Server.KeyLimit)
+	require.Equal(t, 8, cfg.Server.MaxConcurrentWireChecks)
 }
 
 func TestLoadNamesTheVariable(t *testing.T) {
@@ -80,6 +90,10 @@ func TestLoadNamesTheVariable(t *testing.T) {
 		EnvDeniedTeams:  "sales",
 		EnvAllowedUsers: "alice",
 		EnvDeniedUsers:  "bob",
+
+		EnvTokenLimit:              "60",
+		EnvKeyLimit:                "0/24h",
+		EnvMaxConcurrentWireChecks: "many",
 	} {
 		setValid(t)
 		t.Setenv(name, value)
