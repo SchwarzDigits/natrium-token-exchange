@@ -74,10 +74,11 @@ Errors have the body `{"error": "<code>"}`:
 | 400 | `bad_request` | not one JSON object with known fields, more than 1 KiB, no usable Ed25519 public key |
 | 401 | `unauthorized` | no Bearer token, or Wire rejects it |
 | 403 | `not_allowed` | the lists do not admit the user |
-| 503 | `unavailable` | Wire cannot be reached or gives no usable answer |
+| 429 | `too_many_requests` | the user reached a limit: too many tokens, or too many keys in use; `Retry-After` gives the seconds to wait |
+| 503 | `unavailable` | Wire cannot be reached or gives no usable answer, or too many token checks run at once (with `Retry-After: 1`) |
 | 500 | `internal` | an error in the server |
 
-The server checks in this order: token, admission, body and key, then it issues. Pages of any origin may call the API
+The server checks in this order: token, admission, body and key, limits, then it issues. Pages of any origin may call the API
 (CORS with `*`, without credentials): the token is set by the client in the header, not added by the browser.
 
 ```
@@ -108,7 +109,7 @@ The server listens on one port and serves:
 | `/.well-known/jwks.json` | the public keys, for the storage server |
 | `/.well-known/live` | liveness probe, always 200 |
 | `/.well-known/ready` | readiness probe, 200 while the server serves; it has no store to wait for |
-| `/metrics` | Prometheus metrics: requests by result, duration of the token check |
+| `/metrics` | Prometheus metrics: requests by result, duration of the token check, users counted against the limits |
 
 Expose `/v1/token` and `/.well-known/jwks.json` only, not the probes and the metrics. The server logs JSON to stdout
 and shuts down on SIGINT and SIGTERM after running requests have finished. It keeps no state: any number of instances
@@ -129,6 +130,9 @@ can run side by side with the same configuration.
 | `NATRIUM_TOKEN_EXCHANGE_DENIED_TEAMS` | no | | team UUIDs whose members get no tokens, or `*`, comma-separated |
 | `NATRIUM_TOKEN_EXCHANGE_ALLOWED_USERS` | see below | | qualified user IDs `<uuid>@<domain>` who get tokens, or `*` for every user, comma-separated |
 | `NATRIUM_TOKEN_EXCHANGE_DENIED_USERS` | no | | qualified user IDs who get no tokens, or `*`, comma-separated |
+| `NATRIUM_TOKEN_EXCHANGE_TOKEN_LIMIT` | no | `60/1h` | tokens one user gets from one instance per window, `<n>/<window>` |
+| `NATRIUM_TOKEN_EXCHANGE_KEY_LIMIT` | no | `10/24h` | distinct client keys one user has in use at one instance; a key is in use until a window has passed since its last token |
+| `NATRIUM_TOKEN_EXCHANGE_MAX_CONCURRENT_WIRE_CHECKS` | no | `64` | token checks with Wire that run at once; a request beyond it gets `503` without asking Wire |
 | `NATRIUM_TOKEN_EXCHANGE_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn` or `error` |
 
 At least one allowed team or allowed user is required; without any, the service would admit nobody. An invalid value
@@ -186,8 +190,9 @@ its own setting in the message.
 | `internal/httpapi` | `POST /v1/token` and the key set: order of the checks, error codes, CORS, logs and metrics |
 | `internal/signing` | the signing keys, the tokens and the key set |
 | `internal/allow` | the lists of allowed and denied teams and users |
+| `internal/limits` | the limits of tokens and keys per user |
 | `internal/wireauth` | the check of Wire access tokens with `GET /self`, taken over from natrium-recovery-server |
-| `internal/platform` | logging, probes, metrics, panic recovery, graceful shutdown |
+| `internal/platform` | logging, probes, metrics, panic recovery, graceful shutdown, process protection |
 
 ## License
 

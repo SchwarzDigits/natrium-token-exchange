@@ -42,7 +42,11 @@ func valid() Config {
 }
 
 func TestDefaultConfig(t *testing.T) {
-	require.Equal(t, time.Hour, DefaultConfig().TokenTTL)
+	cfg := DefaultConfig()
+	require.Equal(t, time.Hour, cfg.TokenTTL)
+	require.Equal(t, Limit{N: 60, Window: time.Hour}, cfg.TokenLimit)
+	require.Equal(t, Limit{N: 10, Window: 24 * time.Hour}, cfg.KeyLimit)
+	require.Equal(t, 64, cfg.MaxConcurrentWireChecks)
 	require.NoError(t, valid().Validate())
 }
 
@@ -75,6 +79,9 @@ func TestValidateNamesTheField(t *testing.T) {
 		{"DeniedTeams", func(c *Config) { c.DeniedTeams = []string{"sales"} }},
 		{"AllowedUsers", func(c *Config) { c.AllowedUsers = []string{"alice"} }},
 		{"DeniedUsers", func(c *Config) { c.DeniedUsers = []string{"bob"} }},
+		{"TokenLimit", func(c *Config) { c.TokenLimit = Limit{} }},
+		{"KeyLimit", func(c *Config) { c.KeyLimit = Limit{N: 1, Window: time.Millisecond} }},
+		{"MaxConcurrentWireChecks", func(c *Config) { c.MaxConcurrentWireChecks = 0 }},
 	} {
 		cfg := valid()
 		tc.change(&cfg)
@@ -197,6 +204,7 @@ func TestRunExchangesATokenEndToEnd(t *testing.T) {
 		require.Equal(t, http.StatusOK, resp.StatusCode, path)
 		if path == PathMetrics {
 			require.Contains(t, string(b), `natrium_token_exchange_requests_total{result="ok"} 1`)
+			require.Contains(t, string(b), `natrium_token_exchange_limited_users 1`)
 		}
 	}
 

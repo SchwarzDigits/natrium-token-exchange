@@ -56,6 +56,9 @@ func TestRunServesWithEnvironmentVariables(t *testing.T) {
 	t.Setenv(config.EnvDeniedTeams, "")
 	t.Setenv(config.EnvAllowedUsers, "")
 	t.Setenv(config.EnvDeniedUsers, "")
+	t.Setenv(config.EnvTokenLimit, "")
+	t.Setenv(config.EnvKeyLimit, "")
+	t.Setenv(config.EnvMaxConcurrentWireChecks, "")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var logs lockedBuffer

@@ -57,16 +57,18 @@ The body is always `{"error": "<code>"}`.
 | 400 | `bad_request` | The body is larger than 1 KiB, is not exactly one JSON object, has unknown fields, `publicKey` is missing, is not base64url without padding, is not 32 bytes or is not a usable Ed25519 public key. |
 | 401 | `unauthorized` | The header `Authorization: Bearer <token>` is missing, or Wire rejects the token. The answer carries `WWW-Authenticate: Bearer`. |
 | 403 | `not_allowed` | The lists of allowed and denied teams and users do not admit the user (see Admission). |
-| 503 | `unavailable` | Wire could not be asked or gave no usable answer. |
+| 429 | `too_many_requests` | The user reached a limit (see Limits). `Retry-After` gives the seconds until the request would be allowed, rounded up. |
+| 503 | `unavailable` | Wire could not be asked or gave no usable answer, or too many token checks run at once; in that case the answer carries `Retry-After: 1` and Wire was not asked. |
 | 500 | `internal` | An error in the server. |
 | 405 | – | Another method than `POST`. |
 
 The server checks in this order:
 
-1. token (a request to Wire),
+1. token (a request to Wire, unless too many checks run at once),
 2. admission,
 3. body and key,
-4. issue.
+4. limits: count the token if it is within the limits,
+5. issue.
 
 ### `GET /.well-known/jwks.json`
 
@@ -143,12 +145,29 @@ other team and nobody without a team; allowed users `*` also admits users withou
 The lists are part of the configuration; a change takes effect when the service is restarted, and for tokens already
 issued once they expire.
 
+## Limits
+
+Each instance counts per user, in memory:
+
+- **Tokens:** at most `TOKEN_LIMIT` tokens in a sliding window, 60 per hour by default. A client renews its token at
+  half its lifetime, so one device needs about two per hour; the rest is room for reloads and reconnects.
+- **Keys in use:** at most `KEY_LIMIT` distinct client keys, 10 per 24 hours by default. A key is in use from its
+  last token until a whole window has passed. A client keeps one key per device, so this bounds how many storage
+  identities, and with them how much space on the storage server, one user can open.
+
+A refused request is not counted. The counts are not shared between instances: with `n` instances a user can get up to
+`n` times the limits.
+
+Before any of this, each instance runs at most `MAX_CONCURRENT_WIRE_CHECKS` token checks with Wire at once. A request
+beyond that is refused at once with `503` and `Retry-After: 1`, so a flood of requests, with valid tokens or not,
+does not become a flood of requests to Wire.
+
 ## CORS
 
 Pages of any origin may call the API. The server answers the preflight (`OPTIONS /v1/token`) with
 `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: POST` and `Access-Control-Allow-Headers:
-Authorization, Content-Type`, and answers requests and the key set with `Access-Control-Allow-Origin: *`. It does
-not allow credentials.
+Authorization, Content-Type`, and answers requests and the key set with `Access-Control-Allow-Origin: *` and
+`Access-Control-Expose-Headers: Retry-After`. It does not allow credentials.
 
 A list of allowed origins would protect nothing here: CORS protects credentials that the browser adds by itself, such
 as cookies, and the API has none. A page without the Wire token gets no further than 401.
@@ -159,3 +178,4 @@ The client derives its storage key from its own secrets and never sends the priv
 Wire login and before it opens a database on the storage server, keeps the token in memory only, and hands it to the
 storage connection whenever that connects. It renews the token at half its lifetime with a current Wire access token.
 A `403` means the user may not use the storage server; the client reports it as its own error rather than retrying.
+After a `429` or a `503` it waits for `Retry-After` and uses its current token as long as it is valid.

@@ -1,6 +1,9 @@
-// Package httpapi serves the token exchange: POST /v1/token checks the Wire token, the admission of its user and the
-// client's public key, and returns a signed token bound to that key. GET /.well-known/jwks.json publishes the keys
-// that verify the tokens.
+// Package httpapi serves the token exchange: POST /v1/token checks the Wire token, the admission of its user, the
+// client's public key and the user's limits, and returns a signed token bound to that key. GET /.well-known/jwks.json
+// publishes the keys that verify the tokens.
+//
+// Only a bounded number of token checks with Wire run at once. A request beyond that is refused at once with 503, so a
+// flood of requests does not turn into a flood of requests to Wire.
 //
 // Any web page may call the API (CORS with origin *). CORS only protects credentials that the browser adds by itself,
 // such as cookies. The API has none: the client sets the Wire token in the Authorization header, and a page without
@@ -18,12 +21,15 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/SchwarzDigits/natrium-token-exchange/internal/limits"
 	"github.com/SchwarzDigits/natrium-token-exchange/internal/signing"
 	"github.com/SchwarzDigits/natrium-token-exchange/internal/wireauth"
 )
@@ -44,13 +50,17 @@ const preflightMaxAge = "600"
 // before it signs; see docs/operations.md.
 const jwksCacheControl = "public, max-age=300"
 
+// overloadedRetryAfter is the Retry-After of a request refused because too many token checks run.
+const overloadedRetryAfter = time.Second
+
 // Error codes in the body of error responses, {"error": "<code>"}.
 const (
-	codeBadRequest   = "bad_request"
-	codeUnauthorized = "unauthorized"
-	codeNotAllowed   = "not_allowed"
-	codeUnavailable  = "unavailable"
-	codeInternal     = "internal"
+	codeBadRequest      = "bad_request"
+	codeUnauthorized    = "unauthorized"
+	codeNotAllowed      = "not_allowed"
+	codeTooManyRequests = "too_many_requests"
+	codeUnavailable     = "unavailable"
+	codeInternal        = "internal"
 )
 
 // Results of a request, in the log and in the metrics.
@@ -59,12 +69,15 @@ const (
 	resultBadRequest   = codeBadRequest
 	resultUnauthorized = codeUnauthorized
 	resultNotAllowed   = codeNotAllowed
+	resultLimited      = "limited"
+	resultOverloaded   = "overloaded"
 	resultUnavailable  = codeUnavailable
 	resultInternal     = codeInternal
 )
 
 var results = []string{
-	resultOK, resultBadRequest, resultUnauthorized, resultNotAllowed, resultUnavailable, resultInternal,
+	resultOK, resultBadRequest, resultUnauthorized, resultNotAllowed, resultLimited, resultOverloaded,
+	resultUnavailable, resultInternal,
 }
 
 // Authenticator returns the user of a Wire access token. See wireauth.Client.
@@ -83,26 +96,41 @@ type Signer interface {
 	JWKS() []byte
 }
 
-// Options configure the handler. All fields are required.
+// Limiter bounds the tokens and keys per user. See limits.Limiter.
+type Limiter interface {
+	Take(user, key string, now time.Time) limits.Decision
+}
+
+// Options configure the handler. All fields are required, except Now.
 type Options struct {
-	Auth    Authenticator
-	Allow   Admitter
-	Signer  Signer
-	Log     *slog.Logger
-	Metrics prometheus.Registerer
+	Auth   Authenticator
+	Allow  Admitter
+	Signer Signer
+	Limits Limiter
+	// MaxConcurrentChecks bounds the token checks with Wire that run at once. At least 1.
+	MaxConcurrentChecks int
+	Log                 *slog.Logger
+	Metrics             prometheus.Registerer
+	// Now returns the current time. nil uses time.Now.
+	Now func() time.Time
 }
 
 // Handler serves the API.
 type Handler struct {
 	opts     Options
+	checks   chan struct{}
 	requests *prometheus.CounterVec
 	wireAuth prometheus.Histogram
 }
 
 // New returns the handler and registers its metrics.
 func New(opts Options) *Handler {
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
 	h := &Handler{
-		opts: opts,
+		opts:   opts,
+		checks: make(chan struct{}, max(opts.MaxConcurrentChecks, 1)),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "natrium_token_exchange_requests_total",
 			Help: "Requests to " + PathToken + " by result.",
@@ -142,6 +170,7 @@ type outcome struct {
 	user   wireauth.User
 	key    string
 	jti    string
+	limit  string
 	err    error
 }
 
@@ -164,6 +193,9 @@ func (h *Handler) token(w http.ResponseWriter, r *http.Request) {
 	if o.jti != "" {
 		attrs = append(attrs, "jti", o.jti)
 	}
+	if o.limit != "" {
+		attrs = append(attrs, "limit", o.limit)
+	}
 	switch {
 	case o.result == resultInternal:
 		h.opts.Log.Error("token", append(attrs, "error", o.err)...)
@@ -174,7 +206,7 @@ func (h *Handler) token(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// serve answers the request in the order: token, admission, body and key, issue.
+// serve answers the request in the order: token, admission, body and key, limits, issue.
 func (h *Handler) serve(w http.ResponseWriter, r *http.Request) outcome {
 	token, ok := bearerToken(r)
 	if !ok {
@@ -182,10 +214,12 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) outcome {
 		writeError(w, http.StatusUnauthorized, codeUnauthorized)
 		return outcome{result: resultUnauthorized}
 	}
-	start := time.Now()
-	user, err := h.opts.Auth.Authenticate(r.Context(), token)
-	h.wireAuth.Observe(time.Since(start).Seconds())
+	user, err := h.authenticate(r.Context(), token)
 	switch {
+	case errors.Is(err, errOverloaded):
+		w.Header().Set("Retry-After", retryAfterSeconds(overloadedRetryAfter))
+		writeError(w, http.StatusServiceUnavailable, codeUnavailable)
+		return outcome{result: resultOverloaded}
 	case errors.Is(err, wireauth.ErrUnauthorized):
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeError(w, http.StatusUnauthorized, codeUnauthorized)
@@ -210,6 +244,13 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) outcome {
 	}
 	o.key = base64.RawURLEncoding.EncodeToString(key)
 
+	if d := h.opts.Limits.Take(user.String(), o.key, h.opts.Now()); !d.Allowed {
+		w.Header().Set("Retry-After", retryAfterSeconds(d.RetryAfter))
+		writeError(w, http.StatusTooManyRequests, codeTooManyRequests)
+		o.result, o.limit = resultLimited, d.Reason
+		return o
+	}
+
 	issued, err := h.opts.Signer.Issue(signing.Grant{Subject: user.String(), Team: user.Team, PublicKey: key})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, codeInternal)
@@ -219,6 +260,29 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) outcome {
 	writeJSON(w, http.StatusOK, tokenResponse{Token: issued.JWT, ExpiresIn: int64(issued.ExpiresIn / time.Second)})
 	o.result, o.jti = resultOK, issued.ID
 	return o
+}
+
+// errOverloaded reports that a token check was not made because MaxConcurrentChecks checks run.
+var errOverloaded = errors.New("httpapi: too many token checks at once")
+
+// authenticate checks token with Wire if fewer than MaxConcurrentChecks checks run, and returns errOverloaded
+// otherwise.
+func (h *Handler) authenticate(ctx context.Context, token string) (wireauth.User, error) {
+	select {
+	case h.checks <- struct{}{}:
+	default:
+		return wireauth.User{}, errOverloaded
+	}
+	defer func() { <-h.checks }()
+	start := time.Now()
+	user, err := h.opts.Auth.Authenticate(ctx, token)
+	h.wireAuth.Observe(time.Since(start).Seconds())
+	return user, err
+}
+
+// retryAfterSeconds rounds d up to whole seconds, at least 1, for a Retry-After header.
+func retryAfterSeconds(d time.Duration) string {
+	return strconv.Itoa(max(int(math.Ceil(d.Seconds())), 1))
 }
 
 // bearerToken returns the token of an "Authorization: Bearer <token>" header.
@@ -284,7 +348,9 @@ func (h *Handler) preflight(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// allowAnyOrigin lets pages of any origin read the answer. Credentials are not allowed; the API needs none.
+// allowAnyOrigin lets pages of any origin read the answer, including Retry-After. Credentials are not allowed; the API
+// needs none.
 func allowAnyOrigin(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
 }

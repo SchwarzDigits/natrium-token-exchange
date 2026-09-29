@@ -14,8 +14,11 @@ import (
 	"slices"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/SchwarzDigits/natrium-token-exchange/internal/allow"
 	"github.com/SchwarzDigits/natrium-token-exchange/internal/httpapi"
+	"github.com/SchwarzDigits/natrium-token-exchange/internal/limits"
 	"github.com/SchwarzDigits/natrium-token-exchange/internal/platform"
 	"github.com/SchwarzDigits/natrium-token-exchange/internal/signing"
 	"github.com/SchwarzDigits/natrium-token-exchange/internal/wireauth"
@@ -39,6 +42,24 @@ const (
 
 // maxClaimLength bounds Issuer and Audience.
 const maxClaimLength = 256
+
+// sweepInterval is the interval at which users are forgotten whose limits have run out of their windows.
+const sweepInterval = time.Minute
+
+// Defaults of the limits.
+var (
+	DefaultTokenLimit              = Limit{N: 60, Window: time.Hour}
+	DefaultKeyLimit                = Limit{N: 10, Window: 24 * time.Hour}
+	DefaultMaxConcurrentWireChecks = 64
+)
+
+// Limit allows N within Window.
+type Limit = limits.Limit
+
+// ParseLimit reads a limit of the form <n>/<window>, e.g. 60/1h.
+func ParseLimit(s string) (Limit, error) {
+	return limits.ParseLimit(s)
+}
 
 // SigningKey is a key that signs tokens: its key ID and its secret Ed25519 seed. cmd/new-signing-key creates one.
 type SigningKey = signing.Key
@@ -77,6 +98,15 @@ type Config struct {
 	DeniedTeams  []string
 	AllowedUsers []string
 	DeniedUsers  []string
+
+	// TokenLimit bounds the tokens one user gets from one instance within the window.
+	TokenLimit Limit
+	// KeyLimit bounds the distinct client keys one user has in use at one instance: a key is in use from its last
+	// token until the window has passed.
+	KeyLimit Limit
+	// MaxConcurrentWireChecks bounds the token checks with Wire that run at once. A request beyond it is refused with
+	// 503 without asking Wire.
+	MaxConcurrentWireChecks int
 }
 
 // rules returns the admission lists of c.
@@ -89,9 +119,15 @@ func (c Config) rules() allow.Rules {
 	}
 }
 
-// DefaultConfig returns the default token lifetime of one hour. The other required fields are left to the caller.
+// DefaultConfig returns the default token lifetime of one hour and the default limits. The other required fields are
+// left to the caller.
 func DefaultConfig() Config {
-	return Config{TokenTTL: DefaultTokenTTL}
+	return Config{
+		TokenTTL:                DefaultTokenTTL,
+		TokenLimit:              DefaultTokenLimit,
+		KeyLimit:                DefaultKeyLimit,
+		MaxConcurrentWireChecks: DefaultMaxConcurrentWireChecks,
+	}
 }
 
 // ConfigError reports an invalid field of Config. Field is the Go field name, so that a caller that reads the
@@ -157,6 +193,15 @@ func (c Config) Validate() error {
 	if _, err := allow.New(c.rules()); err != nil {
 		return invalid("AllowedTeams", "%v; set AllowedTeams or AllowedUsers", err)
 	}
+	if err := c.TokenLimit.Check(); err != nil {
+		return invalid("TokenLimit", "%v", err)
+	}
+	if err := c.KeyLimit.Check(); err != nil {
+		return invalid("KeyLimit", "%v", err)
+	}
+	if c.MaxConcurrentWireChecks < 1 {
+		return invalid("MaxConcurrentWireChecks", "must be at least 1, got %d", c.MaxConcurrentWireChecks)
+	}
 	return nil
 }
 
@@ -175,6 +220,9 @@ func checkClaim(s string) error {
 
 // Run validates the configuration and serves until ctx is canceled. It then waits for running requests and returns
 // after the shutdown.
+//
+// Run makes the process not dumpable and turns off core dumps (on Linux), because the signing keys are in its memory
+// and its environment.
 func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	return run(ctx, cfg, log, dependencies{})
 }
@@ -187,6 +235,9 @@ type dependencies struct {
 
 func run(ctx context.Context, cfg Config, log *slog.Logger, deps dependencies) error {
 	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if err := platform.ProtectProcess(); err != nil {
 		return err
 	}
 	wire, err := wireauth.New(cfg.WireAPIURL, deps.wireHTTP)
@@ -206,14 +257,35 @@ func run(ctx context.Context, cfg Config, log *slog.Logger, deps dependencies) e
 		return invalid("AllowedTeams", "%v", err)
 	}
 
+	limiter, err := limits.New(cfg.TokenLimit, cfg.KeyLimit)
+	if err != nil {
+		return invalid("TokenLimit", "%v", err)
+	}
+	sweepCtx, stopSweep := context.WithCancel(ctx)
+	sweepDone := make(chan struct{})
+	go func() {
+		defer close(sweepDone)
+		limiter.Run(sweepCtx, sweepInterval)
+	}()
+	defer func() {
+		stopSweep()
+		<-sweepDone
+	}()
+
 	registry := platform.NewRegistry()
+	registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "natrium_token_exchange_limited_users",
+		Help: "Number of users whose tokens or keys are being counted against the limits.",
+	}, func() float64 { return float64(limiter.Users()) }))
 	mux := http.NewServeMux()
 	httpapi.New(httpapi.Options{
-		Auth:    wire,
-		Allow:   list,
-		Signer:  signer,
-		Log:     log,
-		Metrics: registry,
+		Auth:                wire,
+		Allow:               list,
+		Signer:              signer,
+		Limits:              limiter,
+		MaxConcurrentChecks: cfg.MaxConcurrentWireChecks,
+		Log:                 log,
+		Metrics:             registry,
 	}).Register(mux)
 	mux.Handle("GET "+PathLive, platform.OKHandler())
 	mux.Handle("GET "+PathReady, platform.ReadyHandler())
@@ -221,6 +293,7 @@ func run(ctx context.Context, cfg Config, log *slog.Logger, deps dependencies) e
 
 	log.Info("starting server", append([]any{"addr", cfg.Addr, "wire_api_url", cfg.WireAPIURL, "issuer", cfg.Issuer,
 		"audience", cfg.Audience, "token_ttl", cfg.TokenTTL.String(), "signing_keys", len(cfg.SigningKeys),
-		"current_key_id", cfg.CurrentKeyID}, list.LogAttrs()...)...)
+		"current_key_id", cfg.CurrentKeyID, "token_limit", cfg.TokenLimit.String(), "key_limit", cfg.KeyLimit.String(),
+		"max_concurrent_wire_checks", cfg.MaxConcurrentWireChecks}, list.LogAttrs()...)...)
 	return platform.Serve(ctx, log, cfg.Addr, platform.Recover(log, mux))
 }
