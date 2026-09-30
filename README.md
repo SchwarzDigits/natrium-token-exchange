@@ -202,7 +202,7 @@ its own setting in the message.
 | `cmd/natrium-token-exchange` | the command: reads the environment and calls `server.Run` |
 | `cmd/new-signing-key` | creates a signing key and prints its entry |
 | `server` | `Config`, `Validate` and `Run`, the public API |
-| `internal/config` | the environment variables of the command |
+| `config` | the environment variables of the command. `LoadFrom` reads them through a function, for programs that receive the settings under other names |
 | `internal/httpapi` | `POST /v1/token` and the key set: order of the checks, error codes, CORS, logs and metrics |
 | `internal/signing` | the signing keys, the tokens and the key set |
 | `internal/allow` | the lists of allowed and denied teams and users |

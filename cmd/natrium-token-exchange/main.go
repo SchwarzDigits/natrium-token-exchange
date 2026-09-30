@@ -10,7 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/SchwarzDigits/natrium-token-exchange/internal/config"
+	"github.com/SchwarzDigits/natrium-token-exchange/config"
 	"github.com/SchwarzDigits/natrium-token-exchange/internal/platform"
 	"github.com/SchwarzDigits/natrium-token-exchange/server"
 )
