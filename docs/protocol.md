@@ -16,8 +16,8 @@ admitted users, for the server the client names. Neither server accepts Wire acc
 - Each token names its server in `aud`. A storage token names only the storage server, so the PIN service refuses
   it. A PIN token also names the storage server, which accepts a token without a key only for looking up the user's
   slot (`GET /v1/slot`), never for a database.
-- A token can name one of the user's Wire clients (`wire_client`), checked with Wire. The storage server labels the
-  user's slot with it, so the client learns which Wire client holds the slot.
+- A token can name one of the user's Wire clients (`wire_client`), checked with Wire. The storage server does not
+  read it: the client that holds the user's slot sets its label itself (`SetSlotLabel`).
 
 ## Flow
 
@@ -41,15 +41,12 @@ For the slot lookup and the PIN service, when the client makes or opens a key fi
 | log in to Wire, get an access token | client |
 | `POST /v1/token` with the Wire token and the audience `pin`, without a key | client |
 | check the Wire token, check the admission, issue a token | service |
-| `GET /v1/slot` at the storage server with the token: which Wire client holds the user's slot | client |
+| `GET /v1/slot` at the storage server with the token: the label of the user's slot, e.g. the Wire client that holds it | client |
 | call the PIN service with the same token | client |
 | verify the token with the key set and take the user from `sub` | storage server, PIN service |
 
 A browser that restores its key file has no key yet: the key comes out of the key file. That is why a PIN token is
 not bound to a key.
-
-The storage token of a client that claims the user's slot names its Wire client (`clientId` in the request). The
-storage server takes the slot's label from that claim.
 
 ## API
 
@@ -155,8 +152,6 @@ The storage server accepts a token only if all of the following hold:
    the private key.
 
 For `GET /v1/slot`, which needs no key, it checks 1 to 4 and takes the user from `sub`.
-
-The storage server reads the slot's label from `wire_client` (`SQLITE_REMOTE_TOKEN_SLOT_LABEL_CLAIM=wire_client`).
 
 The server loads the key set from `/.well-known/jwks.json` and keeps it no longer than its `max-age`, which the
 rotation of the signing keys relies on. A token with an unknown `kid` should make it fetch the key set again, at most

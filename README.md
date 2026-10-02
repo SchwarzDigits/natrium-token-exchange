@@ -30,8 +30,9 @@ same with its own tokens, so it never holds a Wire access token, which acts for 
 - **One token per server.** Each kind of token names its server in `aud`. A PIN token also names the storage server,
   which accepts a token without a key only for looking up the user's slot; the PIN service does not accept storage
   tokens.
-- **Bound to a Wire client.** A request may name one of the user's Wire clients. The service checks it with Wire and
-  writes it into the token; the storage server labels the user's slot with it.
+- **Optionally naming a Wire client.** A request may name one of the user's Wire clients. The service checks it with
+  Wire and writes it into the token as `wire_client`. The storage server does not use it; the client sets the label of
+  its slot itself.
 - **No state.** The service has no database. Any number of instances can run with the same configuration.
 
 ## How it works
