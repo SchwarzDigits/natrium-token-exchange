@@ -1,6 +1,7 @@
-// Package wireauth checks a Wire access token by asking the Wire backend whose user it belongs to (GET /self). The
-// backend stays the only party that decides whether a token is valid. The package depends on nothing else in this
-// module. It is taken over from natrium-pin-service and additionally reads the user's team.
+// Package wireauth checks a Wire access token by asking the Wire backend whose user it belongs to (GET /self), and
+// whether that user has a given client (GET /clients/{id}). The backend stays the only party that decides whether a
+// token is valid. The package depends on nothing else in this module. It is taken over from natrium-pin-service and
+// additionally reads the user's team.
 package wireauth
 
 import (
@@ -23,6 +24,9 @@ const (
 	// maxTokenLength bounds the tokens passed to the backend. Wire access tokens have about 200 characters.
 	maxTokenLength = 4096
 	selfPath       = "/self"
+	clientsPath    = "/clients/"
+	// maxClientIDLength is the length of a Wire client ID: a 64-bit number in hexadecimal digits.
+	maxClientIDLength = 16
 )
 
 var (
@@ -30,6 +34,8 @@ var (
 	ErrUnauthorized = errors.New("wireauth: the token was rejected")
 	// ErrUnavailable reports that the backend could not be asked or gave no usable answer.
 	ErrUnavailable = errors.New("wireauth: the Wire backend is unavailable")
+	// ErrUnknownClient reports that the user of the token has no client with the given ID.
+	ErrUnknownClient = errors.New("wireauth: the user has no such client")
 )
 
 // QualifiedID identifies a Wire user across backends. Domain is lowercase and ID is a lowercase UUID in the form
@@ -53,7 +59,7 @@ type User struct {
 
 // Client checks tokens against one Wire backend.
 type Client struct {
-	selfURL string
+	apiURL  string
 	http    *http.Client
 	timeout time.Duration
 }
@@ -84,7 +90,7 @@ func New(apiURL string, httpClient *http.Client) (*Client, error) {
 		c = *httpClient
 	}
 	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &Client{selfURL: strings.TrimSuffix(apiURL, "/") + selfPath, http: &c, timeout: defaultTimeout}, nil
+	return &Client{apiURL: strings.TrimSuffix(apiURL, "/"), http: &c, timeout: defaultTimeout}, nil
 }
 
 // Authenticate asks the backend for the user of token. It returns ErrUnauthorized if the token is missing or the
@@ -96,24 +102,12 @@ func (c *Client) Authenticate(ctx context.Context, token string) (User, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.selfURL, nil)
+	resp, err := c.get(ctx, token, selfPath)
 	if err != nil {
-		return User{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return User{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
+		return User{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	switch resp.StatusCode {
-	case http.StatusOK:
-	case http.StatusUnauthorized, http.StatusForbidden:
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
-		return User{}, ErrUnauthorized
-	default:
+	if resp.StatusCode != http.StatusOK {
 		return User{}, fmt.Errorf("%w: GET %s answered %d", ErrUnavailable, selfPath, resp.StatusCode)
 	}
 
@@ -143,6 +137,56 @@ func (c *Client) Authenticate(ctx context.Context, token string) (User, error) {
 	return user, nil
 }
 
+// CheckClient asks the backend whether the user of token has the client clientID (GET /clients/{id}). It returns
+// ErrUnknownClient if not or if clientID is not a client ID (see IsClientID), ErrUnauthorized if the token is missing
+// or the backend rejects it, and ErrUnavailable, wrapped with the cause, if the backend cannot be asked or its answer
+// is not usable. Errors never contain the token.
+func (c *Client) CheckClient(ctx context.Context, token, clientID string) error {
+	if !plausibleToken(token) {
+		return ErrUnauthorized
+	}
+	if !IsClientID(clientID) {
+		return ErrUnknownClient
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	resp, err := c.get(ctx, token, clientsPath+clientID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return nil
+	case http.StatusNotFound:
+		return ErrUnknownClient
+	default:
+		return fmt.Errorf("%w: GET %s{id} answered %d", ErrUnavailable, clientsPath, resp.StatusCode)
+	}
+}
+
+// get sends GET path with token. It returns ErrUnauthorized for 401 and 403, after reading the body, and
+// ErrUnavailable if the request fails. Any other response is returned for the caller to close.
+func (c *Client) get(ctx context.Context, token, path string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiURL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
+		_ = resp.Body.Close()
+		return nil, ErrUnauthorized
+	}
+	return resp, nil
+}
+
 // plausibleToken reports whether token can be sent in a header: not empty, not too long, only visible ASCII. It does
 // not look at the token's format; that is up to the backend.
 func plausibleToken(token string) bool {
@@ -164,6 +208,19 @@ func IsDomain(s string) bool {
 	}
 	for _, c := range []byte(s) {
 		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+// IsClientID reports whether s is a Wire client ID: 1 to 16 lowercase hexadecimal digits.
+func IsClientID(s string) bool {
+	if s == "" || len(s) > maxClientIDLength {
+		return false
+	}
+	for _, c := range []byte(s) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}

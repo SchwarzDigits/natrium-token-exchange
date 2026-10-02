@@ -13,7 +13,11 @@ admitted users, for the server the client names. Neither server accepts Wire acc
   hand them to an attacker.
 - Only this service decides who is admitted, by team and by user.
 - A storage token is bound to the client's key for the storage server, so a copied token is useless without that key.
-- Each token names its server in `aud`, so a token for one server is refused by the other.
+- Each token names its server in `aud`. A storage token names only the storage server, so the PIN service refuses
+  it. A PIN token also names the storage server, which accepts a token without a key only for looking up the user's
+  slot (`GET /v1/slot`), never for a database.
+- A token can name one of the user's Wire clients (`wire_client`), checked with Wire. The storage server labels the
+  user's slot with it, so the client learns which Wire client holds the slot.
 
 ## Flow
 
@@ -30,18 +34,22 @@ For the storage server:
 The client asks for a new token before the old one expires, at half its lifetime, and whenever the storage server
 refuses a token. The storage server ends a connection when its token expires; the client reconnects with a new one.
 
-For the PIN service, when the client makes or opens a key file:
+For the slot lookup and the PIN service, when the client makes or opens a key file:
 
 | Step | Party |
 |---|---|
 | log in to Wire, get an access token | client |
 | `POST /v1/token` with the Wire token and the audience `pin`, without a key | client |
 | check the Wire token, check the admission, issue a token | service |
-| call the PIN service with the token | client |
-| verify the token with the key set and take the user from `sub` | PIN service |
+| `GET /v1/slot` at the storage server with the token: which Wire client holds the user's slot | client |
+| call the PIN service with the same token | client |
+| verify the token with the key set and take the user from `sub` | storage server, PIN service |
 
 A browser that restores its key file has no key yet: the key comes out of the key file. That is why a PIN token is
 not bound to a key.
+
+The storage token of a client that claims the user's slot names its Wire client (`clientId` in the request). The
+storage server takes the slot's label from that claim.
 
 ## API
 
@@ -52,13 +60,14 @@ POST /v1/token
 Authorization: Bearer <Wire access token>
 Content-Type: application/json
 
-{"audience": "storage", "publicKey": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}
+{"audience": "storage", "publicKey": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo", "clientId": "3a7e1b9f2c4d5e6f"}
 ```
 
 | Field | Meaning |
 |---|---|
 | `audience` | Required. `storage` for a token for the storage server, `pin` for a token for the PIN service. `pin` exists only if the service is configured with a PIN audience. |
 | `publicKey` | Required for `storage`, not allowed for `pin`. The client's Ed25519 public key for the storage server: 32 bytes in base64url without padding (RFC 4648, section 5), as in the `x` member of a JSON Web Key. It must be a point of the curve and not of small order. |
+| `clientId` | Optional, for both audiences. The ID of one of the user's Wire clients: 1 to 16 lowercase hexadecimal digits. The service asks Wire `GET /clients/{clientId}` with the Wire token; if Wire does not know the client for this user, the request fails with `unknown_client`. The token then carries it as `wire_client`. |
 
 Answer `200`:
 
@@ -78,21 +87,23 @@ The body is always `{"error": "<code>"}`.
 
 | Status | Code | When |
 |---|---|---|
-| 400 | `bad_request` | The body is larger than 1 KiB, is not exactly one JSON object, or has unknown fields; `audience` is missing or unknown; for `storage`, `publicKey` is missing, is not base64url without padding, is not 32 bytes or is not a usable Ed25519 public key; for `pin`, `publicKey` is present. |
+| 400 | `bad_request` | The body is larger than 1 KiB, is not exactly one JSON object, or has unknown fields; `audience` is missing or unknown; for `storage`, `publicKey` is missing, is not base64url without padding, is not 32 bytes or is not a usable Ed25519 public key; for `pin`, `publicKey` is present; `clientId` is not 1 to 16 lowercase hexadecimal digits. |
+| 400 | `unknown_client` | Wire answers `GET /clients/{clientId}` with 404: the user has no such client. |
 | 401 | `unauthorized` | The header `Authorization: Bearer <token>` is missing, or Wire rejects the token. The answer carries `WWW-Authenticate: Bearer`. |
 | 403 | `not_allowed` | The lists of allowed and denied teams and users do not admit the user (see Admission). |
 | 429 | `too_many_requests` | The user reached a limit (see Limits). `Retry-After` gives the seconds until the request would be allowed, rounded up. |
-| 503 | `unavailable` | Wire could not be asked or gave no usable answer, or too many token checks run at once; in that case the answer carries `Retry-After: 1` and Wire was not asked. |
+| 503 | `unavailable` | Wire could not be asked or gave no usable answer, or too many requests to Wire run at once; in that case the answer carries `Retry-After: 1` and Wire was not asked. |
 | 500 | `internal` | An error in the server. |
 | 405 | – | Another method than `POST`. |
 
 The server checks in this order:
 
-1. token (a request to Wire, unless too many checks run at once),
+1. token (a request to Wire, unless too many requests run at once),
 2. admission,
-3. body: audience and key,
-4. limits: count the token if it is within the limits,
-5. issue.
+3. body: audience, key and the form of `clientId`,
+4. Wire client, if the request names one (a second request to Wire),
+5. limits: count the token if it is within the limits,
+6. issue.
 
 ### `GET /.well-known/jwks.json`
 
@@ -123,10 +134,11 @@ Claims:
 | Claim | Value |
 |---|---|
 | `iss` | the configured issuer, e.g. `https://token.example` |
-| `aud` | the configured audience of the requested kind: the storage server, e.g. `wss://vfs.example/v1/ws`, or the PIN service, e.g. `https://pin.example`. A single string |
+| `aud` | for `storage` the storage server, e.g. `wss://vfs.example/v1/ws`, as a single string; for `pin` an array of the PIN service and the storage server, e.g. `["https://pin.example", "wss://vfs.example/v1/ws"]` |
 | `sub` | the user's qualified ID from `GET /self`, `<uuid>@<domain>` in lowercase |
 | `team` | the user's team, a lowercase UUID. Absent for a user without a team |
 | `cnf` | storage tokens only: the client's key (RFC 7800), `{"jwk": {"kty": "OKP", "crv": "Ed25519", "x": "<publicKey>"}}` |
+| `wire_client` | the `clientId` of the request, checked with Wire. Absent without one |
 | `iat`, `nbf` | the time of issue, in seconds since the epoch |
 | `exp` | `iat` plus the configured lifetime of the kind |
 | `jti` | a random ID of 16 bytes in base64url, for logs |
@@ -142,6 +154,10 @@ The storage server accepts a token only if all of the following hold:
 5. `cnf.jwk` is an Ed25519 key whose `x` is the public key of the connection's `Hello`, and the client proves it holds
    the private key.
 
+For `GET /v1/slot`, which needs no key, it checks 1 to 4 and takes the user from `sub`.
+
+The storage server reads the slot's label from `wire_client` (`SQLITE_REMOTE_TOKEN_SLOT_LABEL_CLAIM=wire_client`).
+
 The server loads the key set from `/.well-known/jwks.json` and keeps it no longer than its `max-age`, which the
 rotation of the signing keys relies on. A token with an unknown `kid` should make it fetch the key set again, at most
 once per minute.
@@ -149,7 +165,7 @@ once per minute.
 ## Verification by the PIN service
 
 The PIN service checks 1 to 4 in the same way, with its own name as `aud`, and takes the user from `sub`. It does not
-look at `cnf`. Since the storage audience and the PIN audience differ, neither server accepts a token of the other.
+look at `cnf`. A storage token names only the storage server, so the PIN service does not accept it.
 
 ## Admission
 
@@ -157,6 +173,10 @@ The service asks `GET /self` of the configured Wire backend with the token, and 
 the team from `team`. It does not cache the answer; 401 and 403 from Wire mean the token is rejected, anything else
 that is not a usable 200 counts as Wire being unavailable. It does not follow redirects, so the token goes only to the
 configured backend.
+
+For a request with `clientId` it then asks `GET /clients/{clientId}` in the same way: 200 means the user has the
+client, 404 that it has not (`unknown_client`), 401 and 403 that the token is rejected, anything else that Wire is
+unavailable.
 
 Four lists decide who is admitted: allowed teams, denied teams, allowed users and denied users. The team lists hold
 team UUIDs, the user lists qualified IDs `<uuid>@<domain>`, and each may hold `*` for all. The most specific entry
@@ -189,9 +209,9 @@ Each instance counts per user, in memory:
 A refused request is not counted. The counts are not shared between instances: with `n` instances a user can get up to
 `n` times the limits.
 
-Before any of this, each instance runs at most `MAX_CONCURRENT_WIRE_CHECKS` token checks with Wire at once. A request
-beyond that is refused at once with `503` and `Retry-After: 1`, so a flood of requests, with valid tokens or not,
-does not become a flood of requests to Wire.
+Before any of this, each instance runs at most `MAX_CONCURRENT_WIRE_CHECKS` requests to Wire at once, token checks
+and client checks together. A request beyond that is refused at once with `503` and `Retry-After: 1`, so a flood of
+requests, with valid tokens or not, does not become a flood of requests to Wire.
 
 ## CORS
 

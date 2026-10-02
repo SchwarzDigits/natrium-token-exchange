@@ -27,8 +27,11 @@ same with its own tokens, so it never holds a Wire access token, which acts for 
   client key that created it. The token only decides who may connect and store at all.
 - **Bound to a key.** A storage token names the client's Ed25519 key (RFC 7800 `cnf`), and the storage server asks for
   a proof of that key at every connection. A copied token is useless.
-- **One token per server.** Each kind of token names its server in `aud`, so neither server accepts the other's
+- **One token per server.** Each kind of token names its server in `aud`. A PIN token also names the storage server,
+  which accepts a token without a key only for looking up the user's slot; the PIN service does not accept storage
   tokens.
+- **Bound to a Wire client.** A request may name one of the user's Wire clients. The service checks it with Wire and
+  writes it into the token; the storage server labels the user's slot with it.
 - **No state.** The service has no database. Any number of instances can run with the same configuration.
 
 ## How it works
@@ -56,7 +59,7 @@ The client asks for a new token at half its lifetime. The storage server ends a 
 and the client reconnects with a new one, so a user who loses access is out after one token lifetime at the latest.
 
 A browser that restores its key file asks for a token with the audience `pin` instead, without a key, since it has
-none yet, and presents it to the PIN service.
+none yet. With it, it looks up the user's slot at the storage server (`GET /v1/slot`) and calls the PIN service.
 
 The [documents](docs/README.md) describe the [protocol](docs/protocol.md), [operations](docs/operations.md) and the
 [threat model](docs/threat-model.md).
@@ -68,13 +71,16 @@ POST /v1/token
 Authorization: Bearer <Wire access token>
 Content-Type: application/json
 
-{"audience": "storage", "publicKey": "<base64url Ed25519 public key>"}
+{"audience": "storage", "publicKey": "<base64url Ed25519 public key>", "clientId": "<Wire client ID>"}
 ```
 
 | `audience` | Token for | `publicKey` | Default lifetime |
 |---|---|---|---|
 | `storage` | the storage server | required: the client's key for the storage server, 32 bytes in base64url without padding (RFC 4648, section 5) | 1 hour |
-| `pin` | the PIN service, if configured | not allowed | 10 minutes |
+| `pin` | the PIN service, if configured, and the slot lookup at the storage server | not allowed | 10 minutes |
+
+`clientId` is optional, for both audiences: one of the user's Wire clients, 1 to 16 lowercase hexadecimal digits. The
+service checks with Wire that the user has it and writes it into the token as `wire_client`.
 
 The answer is `{"token": "<JWT>", "expiresIn": 3600}`, with the lifetime in seconds.
 
@@ -82,14 +88,15 @@ Errors have the body `{"error": "<code>"}`:
 
 | Status | Code | When |
 |---|---|---|
-| 400 | `bad_request` | not one JSON object with known fields, more than 1 KiB, an unknown audience, a missing or unusable key for `storage`, a key for `pin` |
+| 400 | `bad_request` | not one JSON object with known fields, more than 1 KiB, an unknown audience, a missing or unusable key for `storage`, a key for `pin`, a `clientId` that is not a Wire client ID |
+| 400 | `unknown_client` | the user has no Wire client with the `clientId` |
 | 401 | `unauthorized` | no Bearer token, or Wire rejects it |
 | 403 | `not_allowed` | the lists do not admit the user |
 | 429 | `too_many_requests` | the user reached a limit: too many tokens, or too many keys in use; `Retry-After` gives the seconds to wait |
-| 503 | `unavailable` | Wire cannot be reached or gives no usable answer, or too many token checks run at once (with `Retry-After: 1`) |
+| 503 | `unavailable` | Wire cannot be reached or gives no usable answer, or too many requests to Wire run at once (with `Retry-After: 1`) |
 | 500 | `internal` | an error in the server |
 
-The server checks in this order: token, admission, body with audience and key, limits, then it issues. Pages of any
+The server checks in this order: token, admission, body with audience and key, Wire client, limits, then it issues. Pages of any
 origin may call the API (CORS with `*`, without credentials): the token is set by the client in the header, not added
 by the browser.
 
@@ -122,7 +129,7 @@ The server listens on one port and serves:
 | `/.well-known/jwks.json` | the public keys, for the storage server and the PIN service |
 | `/.well-known/live` | liveness probe, always 200 |
 | `/.well-known/ready` | readiness probe, 200 while the server serves; it has no store to wait for |
-| `/metrics` | Prometheus metrics: requests by result, tokens by audience, duration of the token check, users counted against the limits |
+| `/metrics` | Prometheus metrics: requests by result, tokens by audience, duration of the requests to Wire, users counted against the limits |
 
 Expose `/v1/token` and `/.well-known/jwks.json` only, not the probes and the metrics. The server logs JSON to stdout
 and shuts down on SIGINT and SIGTERM after running requests have finished. It keeps no state: any number of instances
@@ -147,7 +154,7 @@ can run side by side with the same configuration.
 | `NATRIUM_TOKEN_EXCHANGE_DENIED_USERS` | no | | qualified user IDs who get no tokens, or `*`, comma-separated |
 | `NATRIUM_TOKEN_EXCHANGE_TOKEN_LIMIT` | no | `60/1h` | tokens of both audiences one user gets from one instance per window, `<n>/<window>` |
 | `NATRIUM_TOKEN_EXCHANGE_KEY_LIMIT` | no | `10/24h` | distinct client keys one user has in use at one instance; a key is in use until a window has passed since its last token |
-| `NATRIUM_TOKEN_EXCHANGE_MAX_CONCURRENT_WIRE_CHECKS` | no | `64` | token checks with Wire that run at once; a request beyond it gets `503` without asking Wire |
+| `NATRIUM_TOKEN_EXCHANGE_MAX_CONCURRENT_WIRE_CHECKS` | no | `64` | requests to Wire that run at once, token and client checks; a request beyond it gets `503` without asking Wire |
 | `NATRIUM_TOKEN_EXCHANGE_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn` or `error` |
 
 At least one allowed team or allowed user is required; without any, the service would admit nobody. An invalid value
@@ -207,7 +214,7 @@ its own setting in the message.
 | `internal/signing` | the signing keys, the tokens and the key set |
 | `internal/allow` | the lists of allowed and denied teams and users |
 | `internal/limits` | the limits of tokens and keys per user |
-| `internal/wireauth` | the check of Wire access tokens with `GET /self` |
+| `internal/wireauth` | the check of Wire access tokens with `GET /self` and of the user's clients with `GET /clients/{id}` |
 | `internal/platform` | logging, probes, metrics, panic recovery, graceful shutdown, process protection |
 
 ## License

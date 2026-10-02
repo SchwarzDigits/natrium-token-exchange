@@ -1,9 +1,9 @@
 // Package httpapi serves the token exchange: POST /v1/token checks the Wire token, the admission of its user, the
-// requested audience with the client's public key where the audience needs one, and the user's limits, and returns a
-// signed token for that audience. GET /.well-known/jwks.json
+// requested audience with the client's public key where the audience needs one, the user's Wire client if the request
+// names one, and the user's limits, and returns a signed token for that audience. GET /.well-known/jwks.json
 // publishes the keys that verify the tokens.
 //
-// Only a bounded number of token checks with Wire run at once. A request beyond that is refused at once with 503, so a
+// Only a bounded number of requests to Wire run at once. A request beyond that is refused at once with 503, so a
 // flood of requests does not turn into a flood of requests to Wire.
 //
 // Any web page may call the API (CORS with origin *). CORS only protects credentials that the browser adds by itself,
@@ -57,6 +57,7 @@ const overloadedRetryAfter = time.Second
 // Error codes in the body of error responses, {"error": "<code>"}.
 const (
 	codeBadRequest      = "bad_request"
+	codeUnknownClient   = "unknown_client"
 	codeUnauthorized    = "unauthorized"
 	codeNotAllowed      = "not_allowed"
 	codeTooManyRequests = "too_many_requests"
@@ -66,24 +67,26 @@ const (
 
 // Results of a request, in the log and in the metrics.
 const (
-	resultOK           = "ok"
-	resultBadRequest   = codeBadRequest
-	resultUnauthorized = codeUnauthorized
-	resultNotAllowed   = codeNotAllowed
-	resultLimited      = "limited"
-	resultOverloaded   = "overloaded"
-	resultUnavailable  = codeUnavailable
-	resultInternal     = codeInternal
+	resultOK            = "ok"
+	resultBadRequest    = codeBadRequest
+	resultUnknownClient = codeUnknownClient
+	resultUnauthorized  = codeUnauthorized
+	resultNotAllowed    = codeNotAllowed
+	resultLimited       = "limited"
+	resultOverloaded    = "overloaded"
+	resultUnavailable   = codeUnavailable
+	resultInternal      = codeInternal
 )
 
 var results = []string{
-	resultOK, resultBadRequest, resultUnauthorized, resultNotAllowed, resultLimited, resultOverloaded,
-	resultUnavailable, resultInternal,
+	resultOK, resultBadRequest, resultUnknownClient, resultUnauthorized, resultNotAllowed, resultLimited,
+	resultOverloaded, resultUnavailable, resultInternal,
 }
 
-// Authenticator returns the user of a Wire access token. See wireauth.Client.
+// Authenticator returns the user of a Wire access token and checks the user's clients. See wireauth.Client.
 type Authenticator interface {
 	Authenticate(ctx context.Context, token string) (wireauth.User, error)
+	CheckClient(ctx context.Context, token, clientID string) error
 }
 
 // Admitter decides whether a user may get a token. See allow.List.
@@ -104,8 +107,8 @@ type Limiter interface {
 
 // Audience is a kind of token that a request names in its audience field.
 type Audience struct {
-	// Aud is the aud claim: the server that accepts the token.
-	Aud string
+	// Aud is the aud claim: the servers that accept the token. The first one is the server the kind is named for.
+	Aud []string
 	// TTL is the lifetime of the token.
 	TTL time.Duration
 	// Key tells whether a request must carry the client's public key, which the token is then bound to. A request for
@@ -121,7 +124,7 @@ type Options struct {
 	Limits Limiter
 	// Audiences are the kinds of token the service issues, by the name a request uses.
 	Audiences map[string]Audience
-	// MaxConcurrentChecks bounds the token checks with Wire that run at once. At least 1.
+	// MaxConcurrentChecks bounds the requests to Wire that run at once. At least 1.
 	MaxConcurrentChecks int
 	Log                 *slog.Logger
 	Metrics             prometheus.Registerer
@@ -156,7 +159,7 @@ func New(opts Options) *Handler {
 		}, []string{"audience"}),
 		wireAuth: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "natrium_token_exchange_wire_auth_duration_seconds",
-			Help:    "Duration of the token check with the Wire backend.",
+			Help:    "Duration of a request to the Wire backend.",
 			Buckets: []float64{.01, .025, .05, .1, .25, .5, 1, 2.5, 5},
 		}),
 	}
@@ -180,6 +183,15 @@ func (h *Handler) Register(mux *http.ServeMux) {
 type tokenRequest struct {
 	Audience  *string `json:"audience"`
 	PublicKey *string `json:"publicKey"`
+	ClientID  *string `json:"clientId"`
+}
+
+// request is a decoded and checked token request.
+type request struct {
+	name     string
+	audience Audience
+	key      ed25519.PublicKey
+	client   string
 }
 
 type tokenResponse struct {
@@ -193,6 +205,7 @@ type outcome struct {
 	user     wireauth.User
 	audience string
 	key      string
+	client   string
 	jti      string
 	limit    string
 	err      error
@@ -217,6 +230,9 @@ func (h *Handler) token(w http.ResponseWriter, r *http.Request) {
 	if o.key != "" {
 		attrs = append(attrs, "key", o.key)
 	}
+	if o.client != "" {
+		attrs = append(attrs, "client", o.client)
+	}
 	if o.jti != "" {
 		attrs = append(attrs, "jti", o.jti)
 	}
@@ -233,7 +249,7 @@ func (h *Handler) token(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// serve answers the request in the order: token, admission, body with audience and key, limits, issue.
+// serve answers the request in the order: token, admission, body with audience and key, client, limits, issue.
 func (h *Handler) serve(w http.ResponseWriter, r *http.Request) outcome {
 	token, ok := bearerToken(r)
 	if !ok {
@@ -263,15 +279,39 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) outcome {
 		return o
 	}
 
-	name, audience, key, err := h.readRequest(w, r)
+	req, err := h.readRequest(w, r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, codeBadRequest)
 		o.result, o.err = resultBadRequest, err
 		return o
 	}
-	o.audience = name
-	if key != nil {
-		o.key = base64.RawURLEncoding.EncodeToString(key)
+	o.audience, o.client = req.name, req.client
+	if req.key != nil {
+		o.key = base64.RawURLEncoding.EncodeToString(req.key)
+	}
+
+	if req.client != "" {
+		err := h.wire(func() error { return h.opts.Auth.CheckClient(r.Context(), token, req.client) })
+		switch {
+		case errors.Is(err, errOverloaded):
+			w.Header().Set("Retry-After", retryAfterSeconds(overloadedRetryAfter))
+			writeError(w, http.StatusServiceUnavailable, codeUnavailable)
+			o.result = resultOverloaded
+			return o
+		case errors.Is(err, wireauth.ErrUnknownClient):
+			writeError(w, http.StatusBadRequest, codeUnknownClient)
+			o.result = resultUnknownClient
+			return o
+		case errors.Is(err, wireauth.ErrUnauthorized):
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeError(w, http.StatusUnauthorized, codeUnauthorized)
+			o.result = resultUnauthorized
+			return o
+		case err != nil:
+			writeError(w, http.StatusServiceUnavailable, codeUnavailable)
+			o.result, o.err = resultUnavailable, err
+			return o
+		}
 	}
 
 	if d := h.opts.Limits.Take(user.String(), o.key, h.opts.Now()); !d.Allowed {
@@ -284,37 +324,49 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) outcome {
 	issued, err := h.opts.Signer.Issue(signing.Grant{
 		Subject:   user.String(),
 		Team:      user.Team,
-		Audience:  audience.Aud,
-		TTL:       audience.TTL,
-		PublicKey: key,
+		Audience:  req.audience.Aud,
+		TTL:       req.audience.TTL,
+		PublicKey: req.key,
+		Client:    req.client,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, codeInternal)
 		o.result, o.err = resultInternal, err
 		return o
 	}
-	h.issued.WithLabelValues(name).Inc()
+	h.issued.WithLabelValues(req.name).Inc()
 	writeJSON(w, http.StatusOK, tokenResponse{Token: issued.JWT, ExpiresIn: int64(issued.ExpiresIn / time.Second)})
 	o.result, o.jti = resultOK, issued.ID
 	return o
 }
 
-// errOverloaded reports that a token check was not made because MaxConcurrentChecks checks run.
-var errOverloaded = errors.New("httpapi: too many token checks at once")
+// errOverloaded reports that a request to Wire was not made because MaxConcurrentChecks requests run.
+var errOverloaded = errors.New("httpapi: too many requests to Wire at once")
 
-// authenticate checks token with Wire if fewer than MaxConcurrentChecks checks run, and returns errOverloaded
-// otherwise.
+// authenticate checks token with Wire, see wire.
 func (h *Handler) authenticate(ctx context.Context, token string) (wireauth.User, error) {
+	var user wireauth.User
+	err := h.wire(func() error {
+		var err error
+		user, err = h.opts.Auth.Authenticate(ctx, token)
+		return err
+	})
+	return user, err
+}
+
+// wire runs call, a request to Wire, if fewer than MaxConcurrentChecks requests run, and returns errOverloaded
+// otherwise.
+func (h *Handler) wire(call func() error) error {
 	select {
 	case h.checks <- struct{}{}:
 	default:
-		return wireauth.User{}, errOverloaded
+		return errOverloaded
 	}
 	defer func() { <-h.checks }()
 	start := time.Now()
-	user, err := h.opts.Auth.Authenticate(ctx, token)
+	err := call()
 	h.wireAuth.Observe(time.Since(start).Seconds())
-	return user, err
+	return err
 }
 
 // retryAfterSeconds rounds d up to whole seconds, at least 1, for a Retry-After header.
@@ -332,46 +384,52 @@ func bearerToken(r *http.Request) (string, bool) {
 }
 
 // readRequest decodes the body strictly: one JSON object with known fields and nothing after it, a configured
-// audience, and, exactly when the audience needs one, a public key in base64url without padding that is a usable
-// Ed25519 public key. It returns the audience's name and configuration, and the key or nil.
-func (h *Handler) readRequest(w http.ResponseWriter, r *http.Request) (string, Audience, ed25519.PublicKey, error) {
+// audience, exactly when the audience needs one a public key in base64url without padding that is a usable Ed25519
+// public key, and optionally a Wire client ID.
+func (h *Handler) readRequest(w http.ResponseWriter, r *http.Request) (request, error) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
-		return "", Audience{}, nil, err
+		return request{}, err
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
-	var req tokenRequest
-	if err := dec.Decode(&req); err != nil {
-		return "", Audience{}, nil, err
+	var tr tokenRequest
+	if err := dec.Decode(&tr); err != nil {
+		return request{}, err
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return "", Audience{}, nil, errors.New("data after the JSON object")
+		return request{}, errors.New("data after the JSON object")
 	}
-	if req.Audience == nil {
-		return "", Audience{}, nil, errors.New("audience is missing")
+	if tr.Audience == nil {
+		return request{}, errors.New("audience is missing")
 	}
-	audience, ok := h.opts.Audiences[*req.Audience]
-	if !ok {
-		return "", Audience{}, nil, errors.New("unknown audience")
+	req := request{name: *tr.Audience}
+	var ok bool
+	if req.audience, ok = h.opts.Audiences[req.name]; !ok {
+		return request{}, errors.New("unknown audience")
+	}
+	if tr.ClientID != nil {
+		if !wireauth.IsClientID(*tr.ClientID) {
+			return request{}, errors.New("clientId is not a Wire client ID")
+		}
+		req.client = *tr.ClientID
 	}
 	switch {
-	case !audience.Key && req.PublicKey != nil:
-		return "", Audience{}, nil, errors.New("publicKey is not allowed for this audience")
-	case !audience.Key:
-		return *req.Audience, audience, nil, nil
-	case req.PublicKey == nil:
-		return "", Audience{}, nil, errors.New("publicKey is missing")
+	case !req.audience.Key && tr.PublicKey != nil:
+		return request{}, errors.New("publicKey is not allowed for this audience")
+	case !req.audience.Key:
+		return req, nil
+	case tr.PublicKey == nil:
+		return request{}, errors.New("publicKey is missing")
 	}
-	raw, err := base64.RawURLEncoding.Strict().DecodeString(*req.PublicKey)
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(*tr.PublicKey)
 	if err != nil {
-		return "", Audience{}, nil, errors.New("publicKey is not base64url without padding")
+		return request{}, errors.New("publicKey is not base64url without padding")
 	}
-	key, err := signing.ParsePublicKey(raw)
-	if err != nil {
-		return "", Audience{}, nil, err
+	if req.key, err = signing.ParsePublicKey(raw); err != nil {
+		return request{}, err
 	}
-	return *req.Audience, audience, key, nil
+	return req, nil
 }
 
 func (h *Handler) jwks(w http.ResponseWriter, _ *http.Request) {
