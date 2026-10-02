@@ -19,8 +19,9 @@ service sees only tokens that act nowhere else.
 | The attacker has | Result |
 |---|---|
 | a storage token | Nothing without the private key it is bound to: the storage server asks for a proof of that key at every connection. The token expires after `STORAGE_TOKEN_TTL`. |
-| a PIN token | PIN guesses for that user at the PIN service, within the PIN service's own limit per user, until the token expires after `PIN_TOKEN_TTL`, and only with the user's key file. Nothing at the storage server or at Wire. |
-| a token for one server, presented to the other | Nothing: `aud` names the server, and the audiences differ. |
+| a PIN token | PIN guesses for that user at the PIN service, within the PIN service's own limit per user, until the token expires after `PIN_TOKEN_TTL`, and only with the user's key file. At the storage server, the label of the user's slot (`GET /v1/slot`), but no database: the storage server requires a token bound to a key for those. Nothing at Wire. |
+| a storage token, presented to the PIN service | Nothing: its `aud` names only the storage server. |
+| a token with the Wire client of another user | Not obtainable: the service checks with Wire that the client belongs to the user of the Wire token. |
 | a Wire access token of an admitted user | Tokens until the Wire token expires, within the user's limits: `KEY_LIMIT` keys per instance, and so as many storage identities, each of which the storage server bounds in space. Not the user's databases: they belong to the user's key. PIN tokens, and with them the user's PIN guesses at the PIN service. |
 | a Wire access token of a user the lists do not admit | Nothing: `403`. |
 | many Wire access tokens, or none, sent at a high rate | No more than `MAX_CONCURRENT_WIRE_CHECKS` checks with Wire at once per instance; the rest is refused with `503` without asking Wire. The per-address limit at the ingress stops a single source earlier. |
@@ -36,8 +37,10 @@ service sees only tokens that act nowhere else.
 - **Admission by team and user**, with allowed and denied lists; a user no entry matches is denied.
 - **Storage tokens bound to a key** (RFC 7800 `cnf`), which the storage server checks against the proof of the key at
   every connection. A copied token is useless.
-- **One audience per server**, so neither server accepts the other's tokens, and **Wire access tokens stay here**:
-  the servers never see one.
+- **Audiences per server**: a storage token names only the storage server, so the PIN service refuses it. A PIN token
+  names both; the storage server accepts a token without a key only for the slot lookup. **Wire access tokens stay
+  here**: the servers never see one.
+- **Wire clients checked with Wire**: a token names a Wire client only if Wire confirms that it belongs to the user.
 - **Short lifetime**, one hour by default, and connections that end with their token. A user who loses the admission
   is out after one token lifetime at the latest.
 - **Limits per user**: tokens and distinct keys in use per window. They bound how many storage identities one account

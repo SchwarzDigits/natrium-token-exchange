@@ -17,7 +17,8 @@ import (
 const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==" +
 	".v=1.k=1.d=1893456000.t=a.l=.u=39b7f597-dfd1-4dff-86f5-fe1b79cb70a0.c=42"
 
-// fakeWire is a Wire backend that answers GET /v15/self with handler and counts the requests.
+// fakeWire is a Wire backend that answers GET /v15/self and GET /v15/clients/{id} with handler and counts the
+// requests.
 type fakeWire struct {
 	server   *httptest.Server
 	requests atomic.Int32
@@ -27,10 +28,12 @@ func newFakeWire(t *testing.T, handler http.HandlerFunc) *fakeWire {
 	t.Helper()
 	f := &fakeWire{}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v15/self", func(w http.ResponseWriter, r *http.Request) {
+	count := func(w http.ResponseWriter, r *http.Request) {
 		f.requests.Add(1)
 		handler(w, r)
-	})
+	}
+	mux.HandleFunc("/v15/self", count)
+	mux.HandleFunc("/v15/clients/{id}", count)
 	mux.HandleFunc("/elsewhere", func(http.ResponseWriter, *http.Request) {
 		t.Error("the client followed a redirect")
 	})
@@ -148,6 +151,45 @@ func TestAuthenticateWithUnreachableBackend(t *testing.T) {
 	require.NotContains(t, err.Error(), token)
 }
 
+func TestCheckClientAsksForTheClientOfTheUser(t *testing.T) {
+	wire := newFakeWire(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		require.Equal(t, "/v15/clients/3a7e1b9f2c4d5e6f", r.URL.Path)
+		require.Equal(t, "Bearer "+token, r.Header.Get("Authorization"))
+		answer(http.StatusOK, `{"id":"3a7e1b9f2c4d5e6f","type":"permanent"}`)(w, r)
+	})
+	require.NoError(t, wire.client(t).CheckClient(context.Background(), token, "3a7e1b9f2c4d5e6f"))
+}
+
+func TestCheckClientSeparatesUnknownClientsFromOtherFailures(t *testing.T) {
+	for status, want := range map[int]error{
+		http.StatusNotFound:            ErrUnknownClient,
+		http.StatusUnauthorized:        ErrUnauthorized,
+		http.StatusForbidden:           ErrUnauthorized,
+		http.StatusInternalServerError: ErrUnavailable,
+		http.StatusFound:               ErrUnavailable,
+	} {
+		wire := newFakeWire(t, func(w http.ResponseWriter, r *http.Request) {
+			if status == http.StatusFound {
+				http.Redirect(w, r, "/elsewhere", status)
+				return
+			}
+			answer(status, `{"code":404,"label":"client-not-found"}`)(w, r)
+		})
+		err := wire.client(t).CheckClient(context.Background(), token, "3a7e1b9f2c4d5e6f")
+		require.ErrorIs(t, err, want, status)
+	}
+}
+
+func TestCheckClientRejectsMalformedIDsWithoutAsking(t *testing.T) {
+	wire := newFakeWire(t, answer(http.StatusOK, `{}`))
+	for _, id := range []string{"", "3A7E", "3a7e1b9f2c4d5e6f0", "../self", "3a7e 1b", "g"} {
+		require.ErrorIs(t, wire.client(t).CheckClient(context.Background(), token, id), ErrUnknownClient, id)
+	}
+	require.ErrorIs(t, wire.client(t).CheckClient(context.Background(), "", "3a7e"), ErrUnauthorized)
+	require.Zero(t, wire.requests.Load())
+}
+
 func TestNewChecksTheURL(t *testing.T) {
 	for _, bad := range []string{
 		"",
@@ -163,7 +205,7 @@ func TestNewChecksTheURL(t *testing.T) {
 	}
 	c, err := New("https://nginz-https.wire.example/v15/", nil)
 	require.NoError(t, err)
-	require.Equal(t, "https://nginz-https.wire.example/v15/self", c.selfURL)
+	require.Equal(t, "https://nginz-https.wire.example/v15", c.apiURL)
 }
 
 // The tests against a real backend need NATRIUM_TOKEN_EXCHANGE_TEST_WIRE_API_URL, e.g.

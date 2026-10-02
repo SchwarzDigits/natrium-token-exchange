@@ -66,9 +66,10 @@ each list, or `*`.
 counts on its own. If users of a large team share one address, the per-address limit at the ingress, not these, is the
 one to raise.
 
-`MAX_CONCURRENT_WIRE_CHECKS` bounds the token checks with Wire per instance. A check normally takes a few tens of
-milliseconds, so the default of 64 allows about a thousand requests per second per instance. Requests beyond it are
-counted as `overloaded` in the metrics.
+`MAX_CONCURRENT_WIRE_CHECKS` bounds the requests to Wire per instance: the token check, and the client check of a
+request that names a Wire client. A check normally takes a few tens of milliseconds, so the default of 64 allows about
+a thousand requests per second per instance, or half as many that name a client. Requests beyond it are counted as
+`overloaded` in the metrics.
 
 ## Probes, metrics and logs
 
@@ -82,11 +83,11 @@ Metrics:
 
 | Metric | Meaning |
 |---|---|
-| `natrium_token_exchange_requests_total{result}` | requests to `/v1/token` by result: `ok`, `bad_request`, `unauthorized`, `not_allowed`, `limited`, `overloaded`, `unavailable`, `internal` |
+| `natrium_token_exchange_requests_total{result}` | requests to `/v1/token` by result: `ok`, `bad_request`, `unknown_client`, `unauthorized`, `not_allowed`, `limited`, `overloaded`, `unavailable`, `internal` |
 | `natrium_token_exchange_tokens_issued_total{audience}` | tokens issued, by audience: `storage`, `pin` |
-| `natrium_token_exchange_wire_auth_duration_seconds` | duration of the token check with Wire |
+| `natrium_token_exchange_wire_auth_duration_seconds` | duration of a request to Wire: the token check, and the client check if the request names a client |
 | `natrium_token_exchange_limited_users` | users whose tokens or keys are counted against the limits |
 
 The server logs one JSON line per request to `/v1/token` with the result, the user, the team, the audience, the
-client's public key, the token's `jti` and, for a refusal by a limit, which limit (`tokens` or `keys`), as far as they are known. It never
+client's public key, the Wire client, the token's `jti` and, for a refusal by a limit, which limit (`tokens` or `keys`), as far as they are known. It never
 logs the Wire token or the issued token.

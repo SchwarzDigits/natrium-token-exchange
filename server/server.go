@@ -95,8 +95,12 @@ type Config struct {
 	StorageTokenTTL time.Duration
 	// PinAudience is the aud claim of the tokens for the PIN service, e.g. https://pin.example. A request for them
 	// names the audience "pin" and carries no key: a browser that restores its key file has no key yet. Empty: the
-	// service issues no PIN tokens. It must differ from StorageAudience, so that neither server accepts the other's
-	// tokens.
+	// service issues no PIN tokens. It must differ from StorageAudience, so that the PIN service does not accept
+	// storage tokens.
+	//
+	// A PIN token also names StorageAudience. The storage server accepts a token without a key only for looking up
+	// the user's slot, so the client can do that before it has its key; for its databases it requires a token bound
+	// to the client's key.
 	PinAudience string
 	// PinTokenTTL is the lifetime of a PIN token, from MinTokenTTL to MaxTokenTTL.
 	PinTokenTTL time.Duration
@@ -244,10 +248,10 @@ func checkTTL(d time.Duration) error {
 // audiences returns the kinds of token c configures.
 func (c Config) audiences() map[string]httpapi.Audience {
 	a := map[string]httpapi.Audience{
-		AudienceStorage: {Aud: c.StorageAudience, TTL: c.StorageTokenTTL, Key: true},
+		AudienceStorage: {Aud: []string{c.StorageAudience}, TTL: c.StorageTokenTTL, Key: true},
 	}
 	if c.PinAudience != "" {
-		a[AudiencePin] = httpapi.Audience{Aud: c.PinAudience, TTL: c.PinTokenTTL}
+		a[AudiencePin] = httpapi.Audience{Aud: []string{c.PinAudience, c.StorageAudience}, TTL: c.PinTokenTTL}
 	}
 	return a
 }

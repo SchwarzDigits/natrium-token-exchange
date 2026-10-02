@@ -190,14 +190,17 @@ func (s *Signer) JWKS() []byte {
 	return s.jwks
 }
 
-// Grant is what a token confirms: the user, the user's team (empty without one), the server that accepts it, its
-// lifetime, and the client key it is bound to. Without a key the token has no cnf claim.
+// Grant is what a token confirms: the user, the user's team (empty without one), the servers that accept it, its
+// lifetime, the client key it is bound to, and the user's Wire client. Without a key the token has no cnf claim,
+// without a client no wire_client claim. A single audience is written as a string, several as an array.
 type Grant struct {
 	Subject   string
 	Team      string
-	Audience  string
+	Audience  []string
 	TTL       time.Duration
 	PublicKey ed25519.PublicKey
+	// Client is the ID of the Wire client the token was requested for, checked with Wire.
+	Client string
 }
 
 // Token is an issued token and what the service logs about it.
@@ -217,9 +220,10 @@ func (s *Signer) Issue(g Grant) (Token, error) {
 	now := s.opts.Now().Unix()
 	c := claims{
 		Issuer:    s.opts.Issuer,
-		Audience:  g.Audience,
+		Audience:  audClaim(g.Audience),
 		Subject:   g.Subject,
 		Team:      g.Team,
+		Client:    g.Client,
 		IssuedAt:  now,
 		NotBefore: now,
 		Expiry:    now + int64(g.TTL/time.Second),
@@ -253,14 +257,24 @@ type jwtHeader struct {
 
 type claims struct {
 	Issuer       string        `json:"iss"`
-	Audience     string        `json:"aud"`
+	Audience     any           `json:"aud"`
 	Subject      string        `json:"sub"`
 	Team         string        `json:"team,omitempty"`
+	Client       string        `json:"wire_client,omitempty"`
 	Confirmation *confirmation `json:"cnf,omitempty"`
 	IssuedAt     int64         `json:"iat"`
 	NotBefore    int64         `json:"nbf"`
 	Expiry       int64         `json:"exp"`
 	ID           string        `json:"jti"`
+}
+
+// audClaim returns the value of the aud claim: one audience as a string, several as an array (RFC 7519, section
+// 4.1.3).
+func audClaim(auds []string) any {
+	if len(auds) == 1 {
+		return auds[0]
+	}
+	return auds
 }
 
 type confirmation struct {

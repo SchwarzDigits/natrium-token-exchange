@@ -104,6 +104,9 @@ func TestPinAudienceIsOptional(t *testing.T) {
 	require.NoError(t, cfg.Validate(), "without a PIN audience its lifetime does not matter")
 	require.NotContains(t, cfg.audiences(), AudiencePin)
 	require.Contains(t, valid().audiences(), AudiencePin)
+	require.Equal(t, []string{valid().PinAudience, valid().StorageAudience}, valid().audiences()[AudiencePin].Aud,
+		"a PIN token also names the storage server, for the slot lookup")
+	require.Equal(t, []string{valid().StorageAudience}, valid().audiences()[AudienceStorage].Aud)
 }
 
 func TestValidAdmissionLists(t *testing.T) {

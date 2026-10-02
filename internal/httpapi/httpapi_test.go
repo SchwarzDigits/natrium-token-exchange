@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -39,8 +40,8 @@ const (
 )
 
 var audiences = map[string]Audience{
-	"storage": {Aud: audience, TTL: time.Hour, Key: true},
-	"pin":     {Aud: pinAud, TTL: 10 * time.Minute},
+	"storage": {Aud: []string{audience}, TTL: time.Hour, Key: true},
+	"pin":     {Aud: []string{pinAud, audience}, TTL: 10 * time.Minute},
 }
 
 type fakeAuth struct {
@@ -48,6 +49,8 @@ type fakeAuth struct {
 	calls int
 	user  wireauth.User
 	err   error
+	// clients are the Wire clients of the user.
+	clients []string
 	// entered and release, if set, hold every check until release is closed.
 	entered chan struct{}
 	release chan struct{}
@@ -68,6 +71,19 @@ func (f *fakeAuth) Authenticate(_ context.Context, t string) (wireauth.User, err
 		return wireauth.User{}, wireauth.ErrUnauthorized
 	}
 	return f.user, nil
+}
+
+func (f *fakeAuth) CheckClient(_ context.Context, t, clientID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	switch {
+	case t != wireToken:
+		return wireauth.ErrUnauthorized
+	case !slices.Contains(f.clients, clientID):
+		return wireauth.ErrUnknownClient
+	}
+	return nil
 }
 
 type failingSigner struct{ *signing.Signer }
@@ -267,6 +283,11 @@ func TestRejectsBadBodies(t *testing.T) {
 		"key is a number":   `{"audience":"storage","publicKey":42}`,
 		"two JSON objects":  body(key) + body(key),
 		"audience a number": `{"audience":1}`,
+		"client upper case": `{"audience":"pin","clientId":"3A7E"}`,
+		"client too long":   `{"audience":"pin","clientId":"3a7e1b9f2c4d5e6f0"}`,
+		"client empty":      `{"audience":"pin","clientId":""}`,
+		"client a path":     `{"audience":"pin","clientId":"../self"}`,
+		"client a number":   `{"audience":"pin","clientId":42}`,
 	} {
 		rec := f.post(t, "Bearer "+wireToken, payload)
 		require.Equal(t, http.StatusBadRequest, rec.Code, name)
@@ -383,10 +404,8 @@ func TestIssuesAPinTokenWithoutKey(t *testing.T) {
 	require.Equal(t, aliceID+"@"+domain, claims["sub"])
 	require.Nil(t, publicKeyOf(t, resp.Token), "a PIN token is not bound to a key")
 
-	_, err = jwt.Parse(resp.Token, func(*jwt.Token) (any, error) {
-		return ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, signing.SeedSize)).Public(), nil
-	}, jwt.WithAudience(audience))
-	require.Error(t, err, "the storage server must not accept a PIN token")
+	require.Equal(t, []any{pinAud, audience}, claims["aud"],
+		"the storage server accepts a PIN token for looking up the slot, which needs no key")
 
 	require.Contains(t, f.logs.String(), `"audience":"pin"`)
 	require.NotContains(t, f.logs.String(), `"key"`)
@@ -401,4 +420,47 @@ func TestPinTokensCountOnlyAsTokens(t *testing.T) {
 		"the key limit of 2 is full, but a PIN token has no key")
 	require.Equal(t, http.StatusTooManyRequests, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code,
 		"the token limit of 3 applies to PIN tokens too")
+}
+
+func TestIssuesTokensForAWireClientOfTheUser(t *testing.T) {
+	f := newFixture(t, nil)
+	f.auth.clients = []string{"3a7e1b9f2c4d5e6f"}
+	key := clientKey(t)
+	rec := f.post(t, "Bearer "+wireToken,
+		`{"audience":"storage","publicKey":"`+base64.RawURLEncoding.EncodeToString(key)+`","clientId":"3a7e1b9f2c4d5e6f"}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var resp struct {
+		Token string `json:"token"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	parsed, _, err := jwt.NewParser().ParseUnverified(resp.Token, jwt.MapClaims{})
+	require.NoError(t, err)
+	claims := parsed.Claims.(jwt.MapClaims)
+	require.Equal(t, "3a7e1b9f2c4d5e6f", claims["wire_client"])
+	require.Equal(t, audience, claims["aud"], "a storage token names only the storage server")
+	require.Contains(t, f.logs.String(), `"client":"3a7e1b9f2c4d5e6f"`)
+
+	rec = f.post(t, "Bearer "+wireToken, `{"audience":"pin","clientId":"3a7e1b9f2c4d5e6f"}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	rec = f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`)
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	parsed, _, err = jwt.NewParser().ParseUnverified(resp.Token, jwt.MapClaims{})
+	require.NoError(t, err)
+	require.NotContains(t, parsed.Claims.(jwt.MapClaims), "wire_client", "without a clientId there is no claim")
+}
+
+func TestRefusesClientsOfOtherUsers(t *testing.T) {
+	f := newFixture(t, nil)
+	f.auth.clients = []string{"3a7e1b9f2c4d5e6f"}
+	rec := f.post(t, "Bearer "+wireToken, `{"audience":"pin","clientId":"1234"}`)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, codeUnknownClient, errorCode(t, rec))
+	require.EqualValues(t, 1, f.count(resultUnknownClient))
+	require.Contains(t, f.logs.String(), `"client":"1234"`)
+
+	for range 3 {
+		require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code,
+			"a refused request is not counted against the limits")
+	}
 }
