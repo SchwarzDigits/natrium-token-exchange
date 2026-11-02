@@ -43,7 +43,8 @@ service sees only tokens that act nowhere else.
 - **Wire clients checked with Wire**: a token names a Wire client only if Wire confirms that it belongs to the user.
 - **Short lifetime**, one hour by default, and connections that end with their token. A user who loses the admission
   is out after one token lifetime at the latest.
-- **Limits per user**: tokens and distinct keys in use per window. They bound how many storage identities one account
+- **Limits per user**: tokens of each audience and distinct keys in use per window. The audiences are counted apart,
+  so that asking for many tokens of one kind cannot keep a user from renewing the others. They bound how many storage identities one account
   can open, which the storage server cannot see, since it knows keys, not users.
 - **A bound on concurrent token checks**, so the service never passes more load to Wire than it is configured for.
 - **Strict parsing**: bodies up to 1 KiB, one JSON object with known fields, public keys that are curve points not of

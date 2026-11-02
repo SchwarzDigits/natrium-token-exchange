@@ -100,9 +100,9 @@ type Signer interface {
 	JWKS() []byte
 }
 
-// Limiter bounds the tokens and keys per user. See limits.Limiter.
+// Limiter bounds the tokens per user and audience and the keys per user. See limits.Limiter.
 type Limiter interface {
-	Take(user, key string, now time.Time) limits.Decision
+	Take(user, audience, key string, now time.Time) limits.Decision
 }
 
 // Audience is a kind of token that a request names in its audience field.
@@ -314,7 +314,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) outcome {
 		}
 	}
 
-	if d := h.opts.Limits.Take(user.String(), o.key, h.opts.Now()); !d.Allowed {
+	if d := h.opts.Limits.Take(user.String(), req.name, o.key, h.opts.Now()); !d.Allowed {
 		w.Header().Set("Retry-After", retryAfterSeconds(d.RetryAfter))
 		writeError(w, http.StatusTooManyRequests, codeTooManyRequests)
 		o.result, o.limit = resultLimited, d.Reason

@@ -416,10 +416,22 @@ func TestPinTokensCountOnlyAsTokens(t *testing.T) {
 	f := newFixture(t, nil)
 	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(clientKey(t))).Code)
 	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(clientKey(t))).Code)
-	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code,
-		"the key limit of 2 is full, but a PIN token has no key")
+	for range 3 {
+		require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code,
+			"the key limit of 2 is full, but a PIN token has no key")
+	}
 	require.Equal(t, http.StatusTooManyRequests, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code,
 		"the token limit of 3 applies to PIN tokens too")
+}
+
+func TestLimitsTokensPerAudience(t *testing.T) {
+	f := newFixture(t, nil)
+	for range 3 {
+		require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code)
+	}
+	require.Equal(t, http.StatusTooManyRequests, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code)
+	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(clientKey(t))).Code,
+		"the PIN tokens do not use up the storage tokens")
 }
 
 func TestIssuesTokensForAWireClientOfTheUser(t *testing.T) {

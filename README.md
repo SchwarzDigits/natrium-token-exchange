@@ -153,7 +153,7 @@ can run side by side with the same configuration.
 | `NATRIUM_TOKEN_EXCHANGE_DENIED_TEAMS` | no | | team UUIDs whose members get no tokens, or `*`, comma-separated |
 | `NATRIUM_TOKEN_EXCHANGE_ALLOWED_USERS` | see below | | qualified user IDs `<uuid>@<domain>` who get tokens, or `*` for every user, comma-separated |
 | `NATRIUM_TOKEN_EXCHANGE_DENIED_USERS` | no | | qualified user IDs who get no tokens, or `*`, comma-separated |
-| `NATRIUM_TOKEN_EXCHANGE_TOKEN_LIMIT` | no | `60/1h` | tokens of both audiences one user gets from one instance per window, `<n>/<window>` |
+| `NATRIUM_TOKEN_EXCHANGE_TOKEN_LIMIT` | no | `60/1h` | tokens of one audience one user gets from one instance per window, `<n>/<window>`; each audience is counted on its own |
 | `NATRIUM_TOKEN_EXCHANGE_KEY_LIMIT` | no | `10/24h` | distinct client keys one user has in use at one instance; a key is in use until a window has passed since its last token |
 | `NATRIUM_TOKEN_EXCHANGE_MAX_CONCURRENT_WIRE_CHECKS` | no | `64` | requests to Wire that run at once, token and client checks; a request beyond it gets `503` without asking Wire |
 | `NATRIUM_TOKEN_EXCHANGE_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn` or `error` |
@@ -214,7 +214,7 @@ its own setting in the message.
 | `internal/httpapi` | `POST /v1/token` and the key set: order of the checks, error codes, CORS, logs and metrics |
 | `internal/signing` | the signing keys, the tokens and the key set |
 | `internal/allow` | the lists of allowed and denied teams and users |
-| `internal/limits` | the limits of tokens and keys per user |
+| `internal/limits` | the limits of tokens per user and audience and of keys per user |
 | `internal/wireauth` | the check of Wire access tokens with `GET /self` and of the user's clients with `GET /clients/{id}` |
 | `internal/platform` | logging, probes, metrics, panic recovery, graceful shutdown, process protection |
 

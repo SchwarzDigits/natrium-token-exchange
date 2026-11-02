@@ -119,7 +119,8 @@ type Config struct {
 	AllowedUsers []string
 	DeniedUsers  []string
 
-	// TokenLimit bounds the tokens one user gets from one instance within the window.
+	// TokenLimit bounds the tokens of one audience that one user gets from one instance within the window. Each
+	// audience is counted on its own, so that tokens of one kind do not use up those of another.
 	TokenLimit Limit
 	// KeyLimit bounds the distinct client keys one user has in use at one instance: a key is in use from its last
 	// token until the window has passed.

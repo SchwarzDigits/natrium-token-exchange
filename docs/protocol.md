@@ -193,9 +193,11 @@ issued once they expire.
 
 Each instance counts per user, in memory:
 
-- **Tokens:** at most `TOKEN_LIMIT` tokens of both audiences in a sliding window, 60 per hour by default. A client
-  renews its storage token at half its lifetime, so one device needs about two per hour; the rest is room for
-  reloads, reconnects and key files. The PIN service limits the PIN guesses on its own.
+- **Tokens:** at most `TOKEN_LIMIT` tokens of each audience in a sliding window, 60 per hour by default. Each
+  audience is counted on its own, so that a client that asks for many tokens of one kind does not keep the user from
+  getting the others: a storage token can still be renewed when the PIN tokens are used up. A client renews its
+  storage token at half its lifetime, so one device needs about two per hour; the rest is room for reloads,
+  reconnects and key files. The PIN service limits the PIN guesses on its own.
 - **Keys in use:** at most `KEY_LIMIT` distinct client keys, 10 per 24 hours by default. A key is in use from its
   last token until a whole window has passed. A client keeps one key per device, so this bounds how many storage
   identities, and with them how much space on the storage server, one user can open. PIN tokens have no key and do
