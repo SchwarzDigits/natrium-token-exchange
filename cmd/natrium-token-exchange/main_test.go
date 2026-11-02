@@ -52,6 +52,8 @@ func TestRunServesWithEnvironmentVariables(t *testing.T) {
 	t.Setenv(config.EnvStorageTokenTTL, "")
 	t.Setenv(config.EnvPinAudience, "https://pin.example")
 	t.Setenv(config.EnvPinTokenTTL, "")
+	t.Setenv(config.EnvCasesAudience, "")
+	t.Setenv(config.EnvCasesTokenTTL, "")
 	t.Setenv(config.EnvSigningKeys, "k1:"+seed)
 	t.Setenv(config.EnvCurrentKeyID, "k1")
 	t.Setenv(config.EnvAllowedTeams, "8b3c1a2e-0f4d-4e5a-9b6c-7d8e9f0a1b2c")

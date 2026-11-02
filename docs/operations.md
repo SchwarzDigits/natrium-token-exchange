@@ -6,12 +6,13 @@ The service needs no database and no other service than the Wire backend. It kee
 instances can run side by side with the same configuration. The configuration is in the
 [README](../README.md#configuration).
 
-Expose only `/v1/token` and `/.well-known/jwks.json`. The storage server and the PIN service need
+Expose only `/v1/token` and `/.well-known/jwks.json`. The storage server, the PIN service and the case registry need
 `/.well-known/jwks.json`; if they run in the same cluster, they can fetch it there, and the key set does not have to be
 public at all.
 
-`STORAGE_AUDIENCE` and `PIN_AUDIENCE` must be the names the storage server and the PIN service expect as `aud`, and
-they must differ. Without `PIN_AUDIENCE` the service issues no PIN tokens.
+`STORAGE_AUDIENCE`, `PIN_AUDIENCE` and `CASES_AUDIENCE` must be the names the storage server, the PIN service and the
+case registry expect as `aud`, and they must differ. Without `PIN_AUDIENCE` the service issues no PIN tokens, without
+`CASES_AUDIENCE` no case tokens.
 
 On Linux the service makes its process not dumpable and turns off core dumps at start: the signing keys are in its
 memory and its environment, and another process of the same user can then read neither through `/proc`.
@@ -33,7 +34,7 @@ A key ID has 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `-` and `_`. A date wo
 
 ### Rotating the signing keys
 
-The servers cache the key set for up to five minutes, and tokens live for `STORAGE_TOKEN_TTL` or `PIN_TOKEN_TTL`. A
+The servers cache the key set for up to five minutes, and tokens live for `STORAGE_TOKEN_TTL`, `PIN_TOKEN_TTL` or `CASES_TOKEN_TTL`. A
 rotation therefore has three steps:
 
 1. **Publish.** Create a new key and add it to `SIGNING_KEYS`, leaving `CURRENT_KEY_ID` at the old key. Deploy, then
@@ -84,7 +85,7 @@ Metrics:
 | Metric | Meaning |
 |---|---|
 | `natrium_token_exchange_requests_total{result}` | requests to `/v1/token` by result: `ok`, `bad_request`, `unknown_client`, `unauthorized`, `not_allowed`, `limited`, `overloaded`, `unavailable`, `internal` |
-| `natrium_token_exchange_tokens_issued_total{audience}` | tokens issued, by audience: `storage`, `pin` |
+| `natrium_token_exchange_tokens_issued_total{audience}` | tokens issued, by audience: `storage`, `pin`, `cases` |
 | `natrium_token_exchange_wire_auth_duration_seconds` | duration of a request to Wire: the token check, and the client check if the request names a client |
 | `natrium_token_exchange_limited_users` | users whose tokens or keys are counted against the limits |
 
