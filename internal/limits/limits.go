@@ -1,6 +1,10 @@
-// Package limits bounds what one user can get from one instance of the service: the tokens issued in a window, and
-// the distinct client keys in use in a window. A key is in use from its last token until a whole window has passed. A
-// token without a key counts only against the tokens.
+// Package limits bounds what one user can get from one instance of the service: the tokens of each audience issued in
+// a window, and the distinct client keys in use in a window. A key is in use from its last token until a whole window
+// has passed. A token without a key counts only against the tokens.
+//
+// Each audience has its own count of tokens, so that a client that asks for many tokens of one audience does not
+// keep the user from getting tokens of another: page code that asks for tokens of a service of its own cannot use
+// up the storage tokens of the same user.
 //
 // The counts are kept in memory. The service has no store, so with several instances each one counts on its own, and
 // a user can get up to the limit from each.
@@ -71,8 +75,8 @@ type Decision struct {
 
 // usage is what one user got within the windows.
 type usage struct {
-	// issued holds the times of the tokens within the token window, oldest first.
-	issued []time.Time
+	// issued holds the times of the tokens within the token window by audience, oldest first.
+	issued map[string][]time.Time
 	// keys holds the last use of each key within the key window.
 	keys map[string]time.Time
 }
@@ -86,7 +90,7 @@ type Limiter struct {
 	users map[string]*usage
 }
 
-// New returns a limiter for the given limits, which must pass Check.
+// New returns a limiter for the given limits, which must pass Check. tokens applies to each audience on its own.
 func New(tokens, keys Limit) (*Limiter, error) {
 	if err := errors.Join(tokens.Check(), keys.Check()); err != nil {
 		return nil, err
@@ -94,19 +98,19 @@ func New(tokens, keys Limit) (*Limiter, error) {
 	return &Limiter{tokens: tokens, keys: keys, users: map[string]*usage{}}, nil
 }
 
-// Take records a token for user and key at now if both limits allow it. An empty key is a token without a key, which
-// only the token limit applies to. A refused request is not recorded.
-func (l *Limiter) Take(user, key string, now time.Time) Decision {
+// Take records a token of audience for user and key at now if both limits allow it. An empty key is a token without
+// a key, which only the token limit applies to. A refused request is not recorded.
+func (l *Limiter) Take(user, audience, key string, now time.Time) Decision {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	u := l.users[user]
 	if u == nil {
-		u = &usage{keys: map[string]time.Time{}}
+		u = &usage{issued: map[string][]time.Time{}, keys: map[string]time.Time{}}
 	}
 	l.prune(u, now)
 
-	if len(u.issued) >= l.tokens.N {
-		return Decision{RetryAfter: u.issued[0].Add(l.tokens.Window).Sub(now), Reason: ReasonTokens}
+	if issued := u.issued[audience]; len(issued) >= l.tokens.N {
+		return Decision{RetryAfter: issued[0].Add(l.tokens.Window).Sub(now), Reason: ReasonTokens}
 	}
 	if _, known := u.keys[key]; key != "" && !known && len(u.keys) >= l.keys.N {
 		oldest := now
@@ -117,7 +121,7 @@ func (l *Limiter) Take(user, key string, now time.Time) Decision {
 		}
 		return Decision{RetryAfter: oldest.Add(l.keys.Window).Sub(now), Reason: ReasonKeys}
 	}
-	u.issued = append(u.issued, now)
+	u.issued[audience] = append(u.issued[audience], now)
 	if key != "" {
 		u.keys[key] = now
 	}
@@ -127,11 +131,17 @@ func (l *Limiter) Take(user, key string, now time.Time) Decision {
 
 // prune drops the tokens and keys whose window has passed at now.
 func (l *Limiter) prune(u *usage, now time.Time) {
-	i := 0
-	for i < len(u.issued) && !now.Before(u.issued[i].Add(l.tokens.Window)) {
-		i++
+	for audience, issued := range u.issued {
+		i := 0
+		for i < len(issued) && !now.Before(issued[i].Add(l.tokens.Window)) {
+			i++
+		}
+		if i == len(issued) {
+			delete(u.issued, audience)
+		} else {
+			u.issued[audience] = issued[i:]
+		}
 	}
-	u.issued = u.issued[i:]
 	for key, used := range u.keys {
 		if !now.Before(used.Add(l.keys.Window)) {
 			delete(u.keys, key)

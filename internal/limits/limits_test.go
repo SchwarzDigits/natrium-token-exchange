@@ -22,47 +22,47 @@ func newLimiter(t *testing.T, tokens, keys Limit) *Limiter {
 func TestTokensPerWindow(t *testing.T) {
 	l := newLimiter(t, Limit{N: 3, Window: time.Hour}, Limit{N: 10, Window: 24 * time.Hour})
 	for i := range 3 {
-		require.True(t, l.Take("alice", "k", start.Add(time.Duration(i)*time.Minute)).Allowed)
+		require.True(t, l.Take("alice", "storage", "k", start.Add(time.Duration(i)*time.Minute)).Allowed)
 	}
-	d := l.Take("alice", "k", start.Add(10*time.Minute))
+	d := l.Take("alice", "storage", "k", start.Add(10*time.Minute))
 	require.False(t, d.Allowed)
 	require.Equal(t, ReasonTokens, d.Reason)
 	require.Equal(t, 50*time.Minute, d.RetryAfter, "until the first token leaves the window")
 
-	require.True(t, l.Take("bob", "k", start.Add(10*time.Minute)).Allowed, "users are counted apart")
-	require.True(t, l.Take("alice", "k", start.Add(time.Hour)).Allowed, "the first token has left the window")
-	require.False(t, l.Take("alice", "k", start.Add(time.Hour)).Allowed)
+	require.True(t, l.Take("bob", "storage", "k", start.Add(10*time.Minute)).Allowed, "users are counted apart")
+	require.True(t, l.Take("alice", "storage", "k", start.Add(time.Hour)).Allowed, "the first token has left the window")
+	require.False(t, l.Take("alice", "storage", "k", start.Add(time.Hour)).Allowed)
 }
 
 func TestRefusalsAreNotCounted(t *testing.T) {
 	l := newLimiter(t, Limit{N: 1, Window: time.Hour}, Limit{N: 10, Window: time.Hour})
-	require.True(t, l.Take("alice", "k", start).Allowed)
+	require.True(t, l.Take("alice", "storage", "k", start).Allowed)
 	for range 5 {
-		require.False(t, l.Take("alice", "k", start.Add(time.Minute)).Allowed)
+		require.False(t, l.Take("alice", "storage", "k", start.Add(time.Minute)).Allowed)
 	}
-	require.True(t, l.Take("alice", "k", start.Add(time.Hour)).Allowed)
+	require.True(t, l.Take("alice", "storage", "k", start.Add(time.Hour)).Allowed)
 }
 
 func TestDistinctKeysInUse(t *testing.T) {
 	l := newLimiter(t, Limit{N: 100, Window: time.Hour}, Limit{N: 2, Window: 24 * time.Hour})
-	require.True(t, l.Take("alice", "k1", start).Allowed)
-	require.True(t, l.Take("alice", "k2", start.Add(time.Hour)).Allowed)
-	require.True(t, l.Take("alice", "k1", start.Add(2*time.Hour)).Allowed, "a key in use counts once")
+	require.True(t, l.Take("alice", "storage", "k1", start).Allowed)
+	require.True(t, l.Take("alice", "storage", "k2", start.Add(time.Hour)).Allowed)
+	require.True(t, l.Take("alice", "storage", "k1", start.Add(2*time.Hour)).Allowed, "a key in use counts once")
 
-	d := l.Take("alice", "k3", start.Add(3*time.Hour))
+	d := l.Take("alice", "storage", "k3", start.Add(3*time.Hour))
 	require.False(t, d.Allowed)
 	require.Equal(t, ReasonKeys, d.Reason)
 	require.Equal(t, 22*time.Hour, d.RetryAfter, "until k2, used longest ago, leaves the window")
 
-	require.True(t, l.Take("bob", "k3", start.Add(3*time.Hour)).Allowed, "keys are counted per user")
-	require.True(t, l.Take("alice", "k3", start.Add(25*time.Hour)).Allowed, "k2 has left the window")
-	require.False(t, l.Take("alice", "k4", start.Add(25*time.Hour)).Allowed, "k1 was used again at +2h")
+	require.True(t, l.Take("bob", "storage", "k3", start.Add(3*time.Hour)).Allowed, "keys are counted per user")
+	require.True(t, l.Take("alice", "storage", "k3", start.Add(25*time.Hour)).Allowed, "k2 has left the window")
+	require.False(t, l.Take("alice", "storage", "k4", start.Add(25*time.Hour)).Allowed, "k1 was used again at +2h")
 }
 
 func TestSweepForgetsIdleUsers(t *testing.T) {
 	l := newLimiter(t, Limit{N: 5, Window: time.Hour}, Limit{N: 5, Window: 2 * time.Hour})
-	l.Take("alice", "k", start)
-	l.Take("bob", "k", start.Add(90*time.Minute))
+	l.Take("alice", "storage", "k", start)
+	l.Take("bob", "storage", "k", start.Add(90*time.Minute))
 	require.Equal(t, 2, l.Users())
 	require.Equal(t, 2, l.Sweep(start.Add(90*time.Minute)))
 	require.Equal(t, 1, l.Sweep(start.Add(2*time.Hour)), "alice's key has left its window")
@@ -78,7 +78,7 @@ func TestConcurrentTakesKeepTheLimit(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if l.Take("alice", fmt.Sprint(i), start).Allowed {
+			if l.Take("alice", "storage", fmt.Sprint(i), start).Allowed {
 				mu.Lock()
 				allowed++
 				mu.Unlock()
@@ -91,7 +91,7 @@ func TestConcurrentTakesKeepTheLimit(t *testing.T) {
 
 func TestRunStopsWithTheContext(t *testing.T) {
 	l := newLimiter(t, Limit{N: 1, Window: time.Second}, Limit{N: 1, Window: time.Second})
-	l.Take("alice", "k", time.Now())
+	l.Take("alice", "storage", "k", time.Now())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -124,10 +124,29 @@ func TestNewChecksTheLimits(t *testing.T) {
 
 func TestTokensWithoutKeyCountOnlyAsTokens(t *testing.T) {
 	l := newLimiter(t, Limit{N: 3, Window: time.Hour}, Limit{N: 1, Window: 24 * time.Hour})
-	require.True(t, l.Take("alice", "k1", start).Allowed)
-	require.True(t, l.Take("alice", "", start).Allowed, "no key, so the full key limit does not apply")
-	require.True(t, l.Take("alice", "", start).Allowed)
-	d := l.Take("alice", "", start)
+	require.True(t, l.Take("alice", "storage", "k1", start).Allowed)
+	require.True(t, l.Take("alice", "pin", "", start).Allowed, "no key, so the full key limit does not apply")
+	require.True(t, l.Take("alice", "pin", "", start).Allowed)
+	require.True(t, l.Take("alice", "pin", "", start).Allowed)
+	d := l.Take("alice", "pin", "", start)
 	require.False(t, d.Allowed)
 	require.Equal(t, ReasonTokens, d.Reason)
+}
+
+func TestAudiencesAreCountedApart(t *testing.T) {
+	l := newLimiter(t, Limit{N: 2, Window: time.Hour}, Limit{N: 10, Window: 24 * time.Hour})
+	require.True(t, l.Take("alice", "cases", "", start).Allowed)
+	require.True(t, l.Take("alice", "cases", "", start.Add(time.Minute)).Allowed)
+	d := l.Take("alice", "cases", "", start.Add(2*time.Minute))
+	require.False(t, d.Allowed)
+	require.Equal(t, ReasonTokens, d.Reason)
+	require.Equal(t, 58*time.Minute, d.RetryAfter)
+
+	require.True(t, l.Take("alice", "storage", "k", start.Add(2*time.Minute)).Allowed,
+		"the cases tokens do not use up the storage tokens")
+	require.True(t, l.Take("alice", "storage", "k", start.Add(2*time.Minute)).Allowed)
+	require.False(t, l.Take("alice", "storage", "k", start.Add(2*time.Minute)).Allowed)
+
+	require.Equal(t, 1, l.Sweep(start.Add(90*time.Minute)), "alice's key is still in its window")
+	require.True(t, l.Take("alice", "cases", "", start.Add(90*time.Minute)).Allowed)
 }

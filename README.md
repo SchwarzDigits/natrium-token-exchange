@@ -2,8 +2,9 @@
 
 The token exchange of [Natrium](https://github.com/SchwarzDigits/natrium). A client that is logged in to Wire exchanges
 its Wire access token for a short-lived token for one of Natrium's servers: a
-[sqlite-remote-server](https://github.com/SchwarzDigits/sqlite-remote-server) that stores its databases, or the
-[natrium-pin-service](https://github.com/SchwarzDigits/natrium-pin-service) that protects its key file with a PIN. The
+[sqlite-remote-server](https://github.com/SchwarzDigits/sqlite-remote-server) that stores its databases, the
+[natrium-pin-service](https://github.com/SchwarzDigits/natrium-pin-service) that protects its key file with a PIN, or
+the case registry that tells the members of a team which conversation belongs to a case. The
 service issues tokens only to the users its lists of allowed and denied teams and users admit, so that not everyone
 with a Wire account can use these servers. The servers verify the tokens offline with the service's public keys, and
 only this service ever sees Wire access tokens.
@@ -20,8 +21,9 @@ briefly unavailable.
 
 This service answers the question once per token. It checks the Wire access token with the Wire backend, applies the
 operator's lists of allowed and denied teams and users, and issues a signed token that lives for an hour by default.
-The storage server verifies that token offline, with the public keys the service publishes. The PIN service does the
-same with its own tokens, so it never holds a Wire access token, which acts for the user at Wire.
+The storage server verifies that token offline, with the public keys the service publishes. The PIN service and the
+case registry do the same with their own tokens, so they never hold a Wire access token, which acts for the user at
+Wire.
 
 - **A gate, not the protection of the data.** The databases are encrypted by the clients, and each belongs to the
   client key that created it. The token only decides who may connect and store at all.
@@ -29,7 +31,7 @@ same with its own tokens, so it never holds a Wire access token, which acts for 
   a proof of that key at every connection. A copied token is useless.
 - **One token per server.** Each kind of token names its server in `aud`. A PIN token also names the storage server,
   which accepts a token without a key only for looking up the user's slot; the PIN service does not accept storage
-  tokens.
+  tokens. A case token names only the case registry.
 - **Optionally naming a Wire client.** A request may name one of the user's Wire clients. The service checks it with
   Wire and writes it into the token as `wire_client`. The storage server does not use it; the client sets the label of
   its slot itself.
@@ -61,6 +63,7 @@ and the client reconnects with a new one, so a user who loses access is out afte
 
 A browser that restores its key file asks for a token with the audience `pin` instead, without a key, since it has
 none yet. With it, it looks up the user's slot at the storage server (`GET /v1/slot`) and calls the PIN service.
+A client that asks the case registry asks for a token with the audience `cases`, also without a key.
 
 The [documents](docs/README.md) describe the [protocol](docs/protocol.md), [operations](docs/operations.md) and the
 [threat model](docs/threat-model.md).
@@ -79,8 +82,9 @@ Content-Type: application/json
 |---|---|---|---|
 | `storage` | the storage server | required: the client's key for the storage server, 32 bytes in base64url without padding (RFC 4648, section 5) | 1 hour |
 | `pin` | the PIN service, if configured, and the slot lookup at the storage server | not allowed | 10 minutes |
+| `cases` | the case registry, if configured | not allowed | 10 minutes |
 
-`clientId` is optional, for both audiences: one of the user's Wire clients, 1 to 16 lowercase hexadecimal digits. The
+`clientId` is optional, for all audiences: one of the user's Wire clients, 1 to 16 lowercase hexadecimal digits. The
 service checks with Wire that the user has it and writes it into the token as `wire_client`.
 
 The answer is `{"token": "<JWT>", "expiresIn": 3600}`, with the lifetime in seconds.
@@ -89,7 +93,7 @@ Errors have the body `{"error": "<code>"}`:
 
 | Status | Code | When |
 |---|---|---|
-| 400 | `bad_request` | not one JSON object with known fields, more than 1 KiB, an unknown audience, a missing or unusable key for `storage`, a key for `pin`, a `clientId` that is not a Wire client ID |
+| 400 | `bad_request` | not one JSON object with known fields, more than 1 KiB, an unknown audience, a missing or unusable key for `storage`, a key for `pin` or `cases`, a `clientId` that is not a Wire client ID |
 | 400 | `unknown_client` | the user has no Wire client with the `clientId` |
 | 401 | `unauthorized` | no Bearer token, or Wire rejects it |
 | 403 | `not_allowed` | the lists do not admit the user |
@@ -105,7 +109,8 @@ by the browser.
 GET /.well-known/jwks.json
 ```
 
-returns the public keys as a JSON Web Key Set. The storage server and the PIN service verify the tokens with it.
+returns the public keys as a JSON Web Key Set. The storage server, the PIN service and the case registry verify the
+tokens with it.
 
 ## Running
 
@@ -127,7 +132,7 @@ The server listens on one port and serves:
 | Path | Purpose |
 |---|---|
 | `/v1/token` | the API |
-| `/.well-known/jwks.json` | the public keys, for the storage server and the PIN service |
+| `/.well-known/jwks.json` | the public keys, for the storage server, the PIN service and the case registry |
 | `/.well-known/live` | liveness probe, always 200 |
 | `/.well-known/ready` | readiness probe, 200 while the server serves; it has no store to wait for |
 | `/metrics` | Prometheus metrics: requests by result, tokens by audience, duration of the requests to Wire, users counted against the limits |
@@ -147,13 +152,15 @@ can run side by side with the same configuration.
 | `NATRIUM_TOKEN_EXCHANGE_STORAGE_TOKEN_TTL` | no | `1h` | lifetime of a storage token, whole seconds from `1m` to `24h` |
 | `NATRIUM_TOKEN_EXCHANGE_PIN_AUDIENCE` | no | | the `aud` claim of PIN tokens: the PIN service, e.g. `https://pin.example`. Must differ from the storage audience. Unset: no PIN tokens |
 | `NATRIUM_TOKEN_EXCHANGE_PIN_TOKEN_TTL` | no | `10m` | lifetime of a PIN token, whole seconds from `1m` to `24h` |
+| `NATRIUM_TOKEN_EXCHANGE_CASES_AUDIENCE` | no | | the `aud` claim of case tokens: the case registry, e.g. `https://cases.example`. Must differ from the storage and PIN audiences. Unset: no case tokens |
+| `NATRIUM_TOKEN_EXCHANGE_CASES_TOKEN_TTL` | no | `10m` | lifetime of a case token, whole seconds from `1m` to `24h` |
 | `NATRIUM_TOKEN_EXCHANGE_SIGNING_KEYS` | yes | | the keys in the key set, comma-separated, each `<key ID>:<base64url seed>` as printed by `new-signing-key`. A secret |
 | `NATRIUM_TOKEN_EXCHANGE_CURRENT_KEY_ID` | yes | | the key that signs new tokens, one of `SIGNING_KEYS` |
 | `NATRIUM_TOKEN_EXCHANGE_ALLOWED_TEAMS` | see below | | team UUIDs whose members get tokens, or `*` for every member of a team, comma-separated |
 | `NATRIUM_TOKEN_EXCHANGE_DENIED_TEAMS` | no | | team UUIDs whose members get no tokens, or `*`, comma-separated |
 | `NATRIUM_TOKEN_EXCHANGE_ALLOWED_USERS` | see below | | qualified user IDs `<uuid>@<domain>` who get tokens, or `*` for every user, comma-separated |
 | `NATRIUM_TOKEN_EXCHANGE_DENIED_USERS` | no | | qualified user IDs who get no tokens, or `*`, comma-separated |
-| `NATRIUM_TOKEN_EXCHANGE_TOKEN_LIMIT` | no | `60/1h` | tokens of both audiences one user gets from one instance per window, `<n>/<window>` |
+| `NATRIUM_TOKEN_EXCHANGE_TOKEN_LIMIT` | no | `60/1h` | tokens of one audience one user gets from one instance per window, `<n>/<window>`; each audience is counted on its own |
 | `NATRIUM_TOKEN_EXCHANGE_KEY_LIMIT` | no | `10/24h` | distinct client keys one user has in use at one instance; a key is in use until a window has passed since its last token |
 | `NATRIUM_TOKEN_EXCHANGE_MAX_CONCURRENT_WIRE_CHECKS` | no | `64` | requests to Wire that run at once, token and client checks; a request beyond it gets `503` without asking Wire |
 | `NATRIUM_TOKEN_EXCHANGE_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn` or `error` |
@@ -214,7 +221,7 @@ its own setting in the message.
 | `internal/httpapi` | `POST /v1/token` and the key set: order of the checks, error codes, CORS, logs and metrics |
 | `internal/signing` | the signing keys, the tokens and the key set |
 | `internal/allow` | the lists of allowed and denied teams and users |
-| `internal/limits` | the limits of tokens and keys per user |
+| `internal/limits` | the limits of tokens per user and audience and of keys per user |
 | `internal/wireauth` | the check of Wire access tokens with `GET /self` and of the user's clients with `GET /clients/{id}` |
 | `internal/platform` | logging, probes, metrics, panic recovery, graceful shutdown, process protection |
 

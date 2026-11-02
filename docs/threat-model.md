@@ -1,6 +1,6 @@
 # Threat model
 
-The service decides who may use the storage server and the PIN service. For the storage server it is a gate against
+The service decides who may use the storage server, the PIN service and the case registry. For the storage server it is a gate against
 strangers filling it with databases, not the protection of the data: the databases are encrypted by the clients, and
 each belongs to the client key that created it. For the PIN service it keeps Wire access tokens away from it: the PIN
 service sees only tokens that act nowhere else.
@@ -21,6 +21,8 @@ service sees only tokens that act nowhere else.
 | a storage token | Nothing without the private key it is bound to: the storage server asks for a proof of that key at every connection. The token expires after `STORAGE_TOKEN_TTL`. |
 | a PIN token | PIN guesses for that user at the PIN service, within the PIN service's own limit per user, until the token expires after `PIN_TOKEN_TTL`, and only with the user's key file. At the storage server, the label of the user's slot (`GET /v1/slot`), but no database: the storage server requires a token bound to a key for those. Nothing at Wire. |
 | a storage token, presented to the PIN service | Nothing: its `aud` names only the storage server. |
+| a case token | What the case registry gives a member of the user's team, until the token expires after `CASES_TOKEN_TTL`. Nothing at the storage server or the PIN service, nothing at Wire. |
+| a case token, presented to the storage server or the PIN service | Nothing: its `aud` names only the case registry. |
 | a token with the Wire client of another user | Not obtainable: the service checks with Wire that the client belongs to the user of the Wire token. |
 | a Wire access token of an admitted user | Tokens until the Wire token expires, within the user's limits: `KEY_LIMIT` keys per instance, and so as many storage identities, each of which the storage server bounds in space. Not the user's databases: they belong to the user's key. PIN tokens, and with them the user's PIN guesses at the PIN service. |
 | a Wire access token of a user the lists do not admit | Nothing: `403`. |
@@ -38,12 +40,14 @@ service sees only tokens that act nowhere else.
 - **Storage tokens bound to a key** (RFC 7800 `cnf`), which the storage server checks against the proof of the key at
   every connection. A copied token is useless.
 - **Audiences per server**: a storage token names only the storage server, so the PIN service refuses it. A PIN token
-  names both; the storage server accepts a token without a key only for the slot lookup. **Wire access tokens stay
+  names both; the storage server accepts a token without a key only for the slot lookup. A case token names only the
+  case registry. **Wire access tokens stay
   here**: the servers never see one.
 - **Wire clients checked with Wire**: a token names a Wire client only if Wire confirms that it belongs to the user.
 - **Short lifetime**, one hour by default, and connections that end with their token. A user who loses the admission
   is out after one token lifetime at the latest.
-- **Limits per user**: tokens and distinct keys in use per window. They bound how many storage identities one account
+- **Limits per user**: tokens of each audience and distinct keys in use per window. The audiences are counted apart,
+  so that asking for many tokens of one kind cannot keep a user from renewing the others. They bound how many storage identities one account
   can open, which the storage server cannot see, since it knows keys, not users.
 - **A bound on concurrent token checks**, so the service never passes more load to Wire than it is configured for.
 - **Strict parsing**: bodies up to 1 KiB, one JSON object with known fields, public keys that are curve points not of

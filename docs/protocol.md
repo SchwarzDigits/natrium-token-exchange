@@ -1,9 +1,10 @@
 # Protocol
 
-Two servers of Natrium admit a client only with a token of this service:
+Up to three servers of Natrium admit a client only with a token of this service:
 
 - a **sqlite-remote-server** stores the client's encrypted databases;
-- the **natrium-pin-service** protects the client's key file with a PIN.
+- the **natrium-pin-service** protects the client's key file with a PIN;
+- the **case registry** tells the members of a team which conversation belongs to a case.
 
 A client gets a token by presenting its Wire access token. The service checks it with Wire and issues a token only to
 admitted users, for the server the client names. Neither server accepts Wire access tokens:
@@ -15,7 +16,7 @@ admitted users, for the server the client names. Neither server accepts Wire acc
 - A storage token is bound to the client's key for the storage server, so a copied token is useless without that key.
 - Each token names its server in `aud`. A storage token names only the storage server, so the PIN service refuses
   it. A PIN token also names the storage server, which accepts a token without a key only for looking up the user's
-  slot (`GET /v1/slot`), never for a database.
+  slot (`GET /v1/slot`), never for a database. A case token names only the case registry.
 - A token can name one of the user's Wire clients (`wire_client`), checked with Wire. The storage server does not
   read it: the client that holds the user's slot sets its label itself (`SetSlotLabel`).
 
@@ -48,6 +49,16 @@ For the slot lookup and the PIN service, when the client makes or opens a key fi
 A browser that restores its key file has no key yet: the key comes out of the key file. That is why a PIN token is
 not bound to a key.
 
+For the case registry:
+
+| Step | Party |
+|---|---|
+| log in to Wire, get an access token | client |
+| `POST /v1/token` with the Wire token and the audience `cases`, without a key | client |
+| check the Wire token, check the admission, issue a token | service |
+| call the case registry with the token as bearer | client |
+| verify the token with the key set and take the user from `sub`, the team from `team` | case registry |
+
 ## API
 
 ### `POST /v1/token`
@@ -62,9 +73,9 @@ Content-Type: application/json
 
 | Field | Meaning |
 |---|---|
-| `audience` | Required. `storage` for a token for the storage server, `pin` for a token for the PIN service. `pin` exists only if the service is configured with a PIN audience. |
-| `publicKey` | Required for `storage`, not allowed for `pin`. The client's Ed25519 public key for the storage server: 32 bytes in base64url without padding (RFC 4648, section 5), as in the `x` member of a JSON Web Key. It must be a point of the curve and not of small order. |
-| `clientId` | Optional, for both audiences. The ID of one of the user's Wire clients: 1 to 16 lowercase hexadecimal digits. The service asks Wire `GET /clients/{clientId}` with the Wire token; if Wire does not know the client for this user, the request fails with `unknown_client`. The token then carries it as `wire_client`. |
+| `audience` | Required. `storage` for a token for the storage server, `pin` for a token for the PIN service, `cases` for a token for the case registry. `pin` and `cases` exist only if the service is configured with a PIN or a cases audience. |
+| `publicKey` | Required for `storage`, not allowed for `pin` and `cases`. The client's Ed25519 public key for the storage server: 32 bytes in base64url without padding (RFC 4648, section 5), as in the `x` member of a JSON Web Key. It must be a point of the curve and not of small order. |
+| `clientId` | Optional, for all audiences. The ID of one of the user's Wire clients: 1 to 16 lowercase hexadecimal digits. The service asks Wire `GET /clients/{clientId}` with the Wire token; if Wire does not know the client for this user, the request fails with `unknown_client`. The token then carries it as `wire_client`. |
 
 Answer `200`:
 
@@ -72,7 +83,7 @@ Answer `200`:
 {"token": "eyJhbGciOiJFZERTQSIsImtpZCI6IjIwMjYtMDkiLCJ0eXAiOiJKV1QifQ.…", "expiresIn": 3600}
 ```
 
-`expiresIn` is the lifetime in seconds: one hour for `storage` and ten minutes for `pin` by default. Answers carry
+`expiresIn` is the lifetime in seconds: one hour for `storage` and ten minutes for `pin` and `cases` by default. Answers carry
 `Cache-Control: no-store`.
 
 The service does not ask for a proof that the client holds the private key. The storage server asks for that proof at
@@ -84,7 +95,7 @@ The body is always `{"error": "<code>"}`.
 
 | Status | Code | When |
 |---|---|---|
-| 400 | `bad_request` | The body is larger than 1 KiB, is not exactly one JSON object, or has unknown fields; `audience` is missing or unknown; for `storage`, `publicKey` is missing, is not base64url without padding, is not 32 bytes or is not a usable Ed25519 public key; for `pin`, `publicKey` is present; `clientId` is not 1 to 16 lowercase hexadecimal digits. |
+| 400 | `bad_request` | The body is larger than 1 KiB, is not exactly one JSON object, or has unknown fields; `audience` is missing or unknown; for `storage`, `publicKey` is missing, is not base64url without padding, is not 32 bytes or is not a usable Ed25519 public key; for `pin` or `cases`, `publicKey` is present; `clientId` is not 1 to 16 lowercase hexadecimal digits. |
 | 400 | `unknown_client` | Wire answers `GET /clients/{clientId}` with 404: the user has no such client. |
 | 401 | `unauthorized` | The header `Authorization: Bearer <token>` is missing, or Wire rejects the token. The answer carries `WWW-Authenticate: Bearer`. |
 | 403 | `not_allowed` | The lists of allowed and denied teams and users do not admit the user (see Admission). |
@@ -131,7 +142,7 @@ Claims:
 | Claim | Value |
 |---|---|
 | `iss` | the configured issuer, e.g. `https://token.example` |
-| `aud` | for `storage` the storage server, e.g. `wss://vfs.example/v1/ws`, as a single string; for `pin` an array of the PIN service and the storage server, e.g. `["https://pin.example", "wss://vfs.example/v1/ws"]` |
+| `aud` | for `storage` the storage server, e.g. `wss://vfs.example/v1/ws`, as a single string; for `pin` an array of the PIN service and the storage server, e.g. `["https://pin.example", "wss://vfs.example/v1/ws"]`; for `cases` the case registry, e.g. `https://cases.example`, as a single string |
 | `sub` | the user's qualified ID from `GET /self`, `<uuid>@<domain>` in lowercase |
 | `team` | the user's team, a lowercase UUID. Absent for a user without a team |
 | `cnf` | storage tokens only: the client's key (RFC 7800), `{"jwk": {"kty": "OKP", "crv": "Ed25519", "x": "<publicKey>"}}` |
@@ -161,6 +172,13 @@ once per minute.
 
 The PIN service checks 1 to 4 in the same way, with its own name as `aud`, and takes the user from `sub`. It does not
 look at `cnf`. A storage token names only the storage server, so the PIN service does not accept it.
+
+## Verification by the case registry
+
+The case registry checks 1 to 4 in the same way, with its own name as `aud`, takes the user from `sub` and the team
+from `team`. A case token names only the case registry, so neither the storage server nor the PIN service accepts it,
+and the registry accepts neither of their tokens. Whether a user without a team may use the registry is for the
+registry to decide.
 
 ## Admission
 
@@ -193,9 +211,11 @@ issued once they expire.
 
 Each instance counts per user, in memory:
 
-- **Tokens:** at most `TOKEN_LIMIT` tokens of both audiences in a sliding window, 60 per hour by default. A client
-  renews its storage token at half its lifetime, so one device needs about two per hour; the rest is room for
-  reloads, reconnects and key files. The PIN service limits the PIN guesses on its own.
+- **Tokens:** at most `TOKEN_LIMIT` tokens of each audience in a sliding window, 60 per hour by default. Each
+  audience is counted on its own, so that a client that asks for many tokens of one kind does not keep the user from
+  getting the others: a storage token can still be renewed when the PIN tokens are used up. A client renews its
+  storage token at half its lifetime, so one device needs about two per hour; the rest is room for reloads,
+  reconnects and key files. The PIN service limits the PIN guesses on its own.
 - **Keys in use:** at most `KEY_LIMIT` distinct client keys, 10 per 24 hours by default. A key is in use from its
   last token until a whole window has passed. A client keeps one key per device, so this bounds how many storage
   identities, and with them how much space on the storage server, one user can open. PIN tokens have no key and do
@@ -223,7 +243,8 @@ as cookies, and the API has none. A page without the Wire token gets no further 
 The client derives its storage key from its own secrets and never sends the private key. It asks for a storage token
 after the Wire login and before it opens a database on the storage server, keeps the token in memory only, and hands
 it to the storage connection whenever that connects. It renews the token at half its lifetime with a current Wire
-access token. It asks for a PIN token right before it calls the PIN service, and for a new one when that has expired.
+access token. It asks for a PIN token right before it calls the PIN service, and for a new one when that has expired. It asks for a
+case token when it calls the case registry and keeps it until half its lifetime.
 
 A `403` means the user may not use the servers; the client reports it as its own error rather than retrying. After a
 `429` or a `503` it waits for `Retry-After` and uses its current token as long as it is valid.

@@ -36,6 +36,7 @@ func valid() Config {
 	cfg.Issuer = "https://token.example"
 	cfg.StorageAudience = "wss://vfs.example/v1/ws"
 	cfg.PinAudience = "https://pin.example"
+	cfg.CasesAudience = "https://cases.example"
 	cfg.SigningKeys = []SigningKey{{ID: "k1", Seed: seed(1)}}
 	cfg.CurrentKeyID = "k1"
 	cfg.AllowedTeams = []string{team}
@@ -46,6 +47,7 @@ func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 	require.Equal(t, time.Hour, cfg.StorageTokenTTL)
 	require.Equal(t, 10*time.Minute, cfg.PinTokenTTL)
+	require.Equal(t, 10*time.Minute, cfg.CasesTokenTTL)
 	require.Equal(t, Limit{N: 60, Window: time.Hour}, cfg.TokenLimit)
 	require.Equal(t, Limit{N: 10, Window: 24 * time.Hour}, cfg.KeyLimit)
 	require.Equal(t, 64, cfg.MaxConcurrentWireChecks)
@@ -71,6 +73,11 @@ func TestValidateNamesTheField(t *testing.T) {
 		{"PinAudience", func(c *Config) { c.PinAudience = "with space" }},
 		{"PinAudience", func(c *Config) { c.PinAudience = c.StorageAudience }},
 		{"PinTokenTTL", func(c *Config) { c.PinTokenTTL = 30 * time.Second }},
+		{"CasesAudience", func(c *Config) { c.CasesAudience = "with space" }},
+		{"CasesAudience", func(c *Config) { c.CasesAudience = strings.Repeat("a", maxClaimLength+1) }},
+		{"CasesAudience", func(c *Config) { c.CasesAudience = c.StorageAudience }},
+		{"CasesAudience", func(c *Config) { c.CasesAudience = c.PinAudience }},
+		{"CasesTokenTTL", func(c *Config) { c.CasesTokenTTL = 25 * time.Hour }},
 		{"SigningKeys", func(c *Config) { c.SigningKeys = nil }},
 		{"SigningKeys", func(c *Config) { c.SigningKeys = []SigningKey{{ID: "k1", Seed: []byte{1}}} }},
 		{"SigningKeys", func(c *Config) {
@@ -107,6 +114,24 @@ func TestPinAudienceIsOptional(t *testing.T) {
 	require.Equal(t, []string{valid().PinAudience, valid().StorageAudience}, valid().audiences()[AudiencePin].Aud,
 		"a PIN token also names the storage server, for the slot lookup")
 	require.Equal(t, []string{valid().StorageAudience}, valid().audiences()[AudienceStorage].Aud)
+}
+
+func TestCasesAudienceIsOptional(t *testing.T) {
+	cfg := valid()
+	cfg.CasesAudience = ""
+	cfg.CasesTokenTTL = 0
+	require.NoError(t, cfg.Validate(), "without a cases audience its lifetime does not matter")
+	require.NotContains(t, cfg.audiences(), AudienceCases)
+
+	a := valid().audiences()[AudienceCases]
+	require.Equal(t, []string{valid().CasesAudience}, a.Aud, "a case token names only the case registry")
+	require.Equal(t, DefaultCasesTokenTTL, a.TTL)
+	require.False(t, a.Key)
+
+	cfg = valid()
+	cfg.PinAudience = ""
+	require.NoError(t, cfg.Validate(), "the cases audience does not need the PIN audience")
+	require.Contains(t, cfg.audiences(), AudienceCases)
 }
 
 func TestValidAdmissionLists(t *testing.T) {

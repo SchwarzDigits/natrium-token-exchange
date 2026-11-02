@@ -37,6 +37,7 @@ const (
 const (
 	DefaultStorageTokenTTL = time.Hour
 	DefaultPinTokenTTL     = 10 * time.Minute
+	DefaultCasesTokenTTL   = 10 * time.Minute
 	MinTokenTTL            = time.Minute
 	MaxTokenTTL            = 24 * time.Hour
 )
@@ -45,6 +46,7 @@ const (
 const (
 	AudienceStorage = "storage"
 	AudiencePin     = "pin"
+	AudienceCases   = "cases"
 )
 
 // maxClaimLength bounds Issuer and the audiences.
@@ -104,6 +106,13 @@ type Config struct {
 	PinAudience string
 	// PinTokenTTL is the lifetime of a PIN token, from MinTokenTTL to MaxTokenTTL.
 	PinTokenTTL time.Duration
+	// CasesAudience is the aud claim of the tokens for the case registry, e.g. https://cases.example. A request for
+	// them names the audience "cases" and carries no key: the registry takes the bearer token over HTTPS and needs
+	// only the user and the team. Empty: the service issues no case tokens. It must differ from StorageAudience and
+	// PinAudience, so that neither server accepts case tokens and the registry accepts no other.
+	CasesAudience string
+	// CasesTokenTTL is the lifetime of a case token, from MinTokenTTL to MaxTokenTTL.
+	CasesTokenTTL time.Duration
 
 	// SigningKeys are the keys in the key set. Required.
 	SigningKeys []SigningKey
@@ -119,7 +128,8 @@ type Config struct {
 	AllowedUsers []string
 	DeniedUsers  []string
 
-	// TokenLimit bounds the tokens one user gets from one instance within the window.
+	// TokenLimit bounds the tokens of one audience that one user gets from one instance within the window. Each
+	// audience is counted on its own, so that tokens of one kind do not use up those of another.
 	TokenLimit Limit
 	// KeyLimit bounds the distinct client keys one user has in use at one instance: a key is in use from its last
 	// token until the window has passed.
@@ -145,6 +155,7 @@ func DefaultConfig() Config {
 	return Config{
 		StorageTokenTTL:         DefaultStorageTokenTTL,
 		PinTokenTTL:             DefaultPinTokenTTL,
+		CasesTokenTTL:           DefaultCasesTokenTTL,
 		TokenLimit:              DefaultTokenLimit,
 		KeyLimit:                DefaultKeyLimit,
 		MaxConcurrentWireChecks: DefaultMaxConcurrentWireChecks,
@@ -195,6 +206,17 @@ func (c Config) Validate() error {
 		}
 		if err := checkTTL(c.PinTokenTTL); err != nil {
 			return invalid("PinTokenTTL", "%v", err)
+		}
+	}
+	if c.CasesAudience != "" {
+		if err := checkClaim(c.CasesAudience); err != nil {
+			return invalid("CasesAudience", "%v, e.g. https://cases.example", err)
+		}
+		if c.CasesAudience == c.StorageAudience || c.CasesAudience == c.PinAudience {
+			return invalid("CasesAudience", "must differ from StorageAudience and PinAudience")
+		}
+		if err := checkTTL(c.CasesTokenTTL); err != nil {
+			return invalid("CasesTokenTTL", "%v", err)
 		}
 	}
 	switch {
@@ -252,6 +274,9 @@ func (c Config) audiences() map[string]httpapi.Audience {
 	}
 	if c.PinAudience != "" {
 		a[AudiencePin] = httpapi.Audience{Aud: []string{c.PinAudience, c.StorageAudience}, TTL: c.PinTokenTTL}
+	}
+	if c.CasesAudience != "" {
+		a[AudienceCases] = httpapi.Audience{Aud: []string{c.CasesAudience}, TTL: c.CasesTokenTTL}
 	}
 	return a
 }
@@ -342,6 +367,7 @@ func run(ctx context.Context, cfg Config, log *slog.Logger, deps dependencies) e
 	log.Info("starting server", append([]any{"addr", cfg.Addr, "wire_api_url", cfg.WireAPIURL, "issuer", cfg.Issuer,
 		"storage_audience", cfg.StorageAudience, "storage_token_ttl", cfg.StorageTokenTTL.String(),
 		"pin_audience", cfg.PinAudience, "pin_token_ttl", cfg.PinTokenTTL.String(),
+		"cases_audience", cfg.CasesAudience, "cases_token_ttl", cfg.CasesTokenTTL.String(),
 		"signing_keys", len(cfg.SigningKeys),
 		"current_key_id", cfg.CurrentKeyID, "token_limit", cfg.TokenLimit.String(), "key_limit", cfg.KeyLimit.String(),
 		"max_concurrent_wire_checks", cfg.MaxConcurrentWireChecks}, list.LogAttrs()...)...)

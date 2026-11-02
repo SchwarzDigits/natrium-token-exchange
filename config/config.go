@@ -23,12 +23,15 @@ const (
 	EnvLogLevel   = "NATRIUM_TOKEN_EXCHANGE_LOG_LEVEL"
 	EnvWireAPIURL = "NATRIUM_TOKEN_EXCHANGE_WIRE_API_URL"
 	EnvIssuer     = "NATRIUM_TOKEN_EXCHANGE_ISSUER"
-	// EnvStorageAudience and EnvPinAudience are the aud claims; the PIN audience is optional.
+	// EnvStorageAudience, EnvPinAudience and EnvCasesAudience are the aud claims; the PIN and cases audiences are
+	// optional.
 	EnvStorageAudience = "NATRIUM_TOKEN_EXCHANGE_STORAGE_AUDIENCE"
 	EnvPinAudience     = "NATRIUM_TOKEN_EXCHANGE_PIN_AUDIENCE"
-	// EnvStorageTokenTTL and EnvPinTokenTTL are Go durations, e.g. 1h or 10m.
+	EnvCasesAudience   = "NATRIUM_TOKEN_EXCHANGE_CASES_AUDIENCE"
+	// EnvStorageTokenTTL, EnvPinTokenTTL and EnvCasesTokenTTL are Go durations, e.g. 1h or 10m.
 	EnvStorageTokenTTL = "NATRIUM_TOKEN_EXCHANGE_STORAGE_TOKEN_TTL"
 	EnvPinTokenTTL     = "NATRIUM_TOKEN_EXCHANGE_PIN_TOKEN_TTL"
+	EnvCasesTokenTTL   = "NATRIUM_TOKEN_EXCHANGE_CASES_TOKEN_TTL"
 	// EnvSigningKeys is a comma-separated list of <key ID>:<base64url seed>. It is a secret.
 	EnvSigningKeys  = "NATRIUM_TOKEN_EXCHANGE_SIGNING_KEYS"
 	EnvCurrentKeyID = "NATRIUM_TOKEN_EXCHANGE_CURRENT_KEY_ID"
@@ -55,6 +58,8 @@ var envOf = map[string]string{
 	"StorageTokenTTL": EnvStorageTokenTTL,
 	"PinAudience":     EnvPinAudience,
 	"PinTokenTTL":     EnvPinTokenTTL,
+	"CasesAudience":   EnvCasesAudience,
+	"CasesTokenTTL":   EnvCasesTokenTTL,
 	"SigningKeys":     EnvSigningKeys,
 	"CurrentKeyID":    EnvCurrentKeyID,
 	"AllowedTeams":    EnvAllowedTeams,
@@ -103,10 +108,11 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 	s.Issuer = getenv(EnvIssuer)
 	s.StorageAudience = getenv(EnvStorageAudience)
 	s.PinAudience = getenv(EnvPinAudience)
+	s.CasesAudience = getenv(EnvCasesAudience)
 	for _, v := range []struct {
 		name string
 		ttl  *time.Duration
-	}{{EnvStorageTokenTTL, &s.StorageTokenTTL}, {EnvPinTokenTTL, &s.PinTokenTTL}} {
+	}{{EnvStorageTokenTTL, &s.StorageTokenTTL}, {EnvPinTokenTTL, &s.PinTokenTTL}, {EnvCasesTokenTTL, &s.CasesTokenTTL}} {
 		if raw := getenv(v.name); raw != "" {
 			d, err := time.ParseDuration(raw)
 			if err != nil {

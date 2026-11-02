@@ -37,11 +37,13 @@ const (
 	issuer    = "https://token.example"
 	audience  = "wss://vfs.example/v1/ws"
 	pinAud    = "https://pin.example"
+	casesAud  = "https://cases.example"
 )
 
 var audiences = map[string]Audience{
 	"storage": {Aud: []string{audience}, TTL: time.Hour, Key: true},
 	"pin":     {Aud: []string{pinAud, audience}, TTL: 10 * time.Minute},
+	"cases":   {Aud: []string{casesAud}, TTL: 10 * time.Minute},
 }
 
 type fakeAuth struct {
@@ -272,6 +274,7 @@ func TestRejectsBadBodies(t *testing.T) {
 		"missing key":       `{"audience":"storage"}`,
 		"null key":          `{"audience":"storage","publicKey":null}`,
 		"key for pin":       `{"audience":"pin","publicKey":"` + encoded + `"}`,
+		"key for cases":     `{"audience":"cases","publicKey":"` + encoded + `"}`,
 		"unknown field":     `{"audience":"storage","publicKey":"` + encoded + `","extra":1}`,
 		"trailing data":     body(key) + `{}`,
 		"padded base64":     `{"audience":"storage","publicKey":"` + base64.URLEncoding.EncodeToString(key) + `"}`,
@@ -412,14 +415,51 @@ func TestIssuesAPinTokenWithoutKey(t *testing.T) {
 	require.EqualValues(t, 1, testutil.ToFloat64(f.api.issued.WithLabelValues("pin")))
 }
 
+func TestIssuesACaseTokenWithoutKey(t *testing.T) {
+	f := newFixture(t, nil)
+	rec := f.post(t, "Bearer "+wireToken, `{"audience":"cases"}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var resp struct {
+		Token     string `json:"token"`
+		ExpiresIn int64  `json:"expiresIn"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.EqualValues(t, 600, resp.ExpiresIn)
+
+	parsed, err := jwt.Parse(resp.Token, func(*jwt.Token) (any, error) {
+		return ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, signing.SeedSize)).Public(), nil
+	}, jwt.WithValidMethods([]string{"EdDSA"}), jwt.WithIssuer(issuer), jwt.WithAudience(casesAud))
+	require.NoError(t, err)
+	claims := parsed.Claims.(jwt.MapClaims)
+	require.Equal(t, aliceID+"@"+domain, claims["sub"])
+	require.Equal(t, team, claims["team"])
+	require.Equal(t, casesAud, claims["aud"], "only the case registry, so the storage server refuses it")
+	require.Nil(t, publicKeyOf(t, resp.Token), "a case token is not bound to a key")
+
+	require.Contains(t, f.logs.String(), `"audience":"cases"`)
+	require.EqualValues(t, 1, testutil.ToFloat64(f.api.issued.WithLabelValues("cases")))
+}
+
 func TestPinTokensCountOnlyAsTokens(t *testing.T) {
 	f := newFixture(t, nil)
 	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(clientKey(t))).Code)
 	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(clientKey(t))).Code)
-	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code,
-		"the key limit of 2 is full, but a PIN token has no key")
+	for range 3 {
+		require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code,
+			"the key limit of 2 is full, but a PIN token has no key")
+	}
 	require.Equal(t, http.StatusTooManyRequests, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code,
 		"the token limit of 3 applies to PIN tokens too")
+}
+
+func TestLimitsTokensPerAudience(t *testing.T) {
+	f := newFixture(t, nil)
+	for range 3 {
+		require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code)
+	}
+	require.Equal(t, http.StatusTooManyRequests, f.post(t, "Bearer "+wireToken, `{"audience":"pin"}`).Code)
+	require.Equal(t, http.StatusOK, f.post(t, "Bearer "+wireToken, body(clientKey(t))).Code,
+		"the PIN tokens do not use up the storage tokens")
 }
 
 func TestIssuesTokensForAWireClientOfTheUser(t *testing.T) {
